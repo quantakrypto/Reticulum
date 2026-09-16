@@ -334,9 +334,12 @@ The primitives listed here **are authoritative**. Anything claiming to be Reticu
 but not using these exact primitives **is not** Reticulum, and possibly an
 intentionally compromised or weakened clone. The utilised primitives are:
 
-- Reticulum Identity Keys are 512-bit Curve25519 keysets
+- Reticulum Identity Keys are Curve25519 keysets by default
   - A 256-bit Ed25519 key for signatures
   - A 256-bit X22519 key for ECDH key exchanges
+- Optional post-quantum profiles can be enabled in configuration
+  - ML-DSA for signatures
+  - ML-KEM for key exchange
 - HKDF for key derivation
 - Encrypted tokens are based on the [Fernet spec](https://github.com/fernet/spec/)
   - Ephemeral keys derived from an ECDH key exchange on Curve25519
@@ -368,6 +371,9 @@ primitives. A trivial consequence of this is performance, with the OpenSSL
 backend being *much* faster. The most important consequence however, is the
 potential loss of security by using primitives that has not seen the same
 amount of scrutiny, testing and review as those from OpenSSL.
+
+When configured for PQ mode, Reticulum additionally uses liboqs-python to
+provide ML-KEM and ML-DSA-backed key exchange and signatures.
 
 Please note that by default, installing Reticulum will **require** OpenSSL and
 PyCA to also be automatically installed if not already available. It is only

@@ -39,7 +39,9 @@ import threading
 from .vendor import umsgpack as umsgpack
 
 from RNS.Cryptography import X25519PrivateKey, X25519PublicKey, Ed25519PrivateKey, Ed25519PublicKey
+from RNS.Cryptography import MLKEMPrivateKey, MLKEMPublicKey, MLDSAPrivateKey, MLDSAPublicKey
 from RNS.Cryptography import Token
+from RNS.Cryptography import PQ as PQCrypto
 
 
 class Identity:
@@ -97,9 +99,182 @@ class Identity:
     ratchet_persist_lock = threading.Lock()
     known_destinations_lock = threading.Lock()
 
+    CRYPTO_LEGACY = "legacy"
+    CRYPTO_HYBRID = "hybrid"
+    CRYPTO_PQ = "pq"
+    CRYPTO_DEFAULT = CRYPTO_LEGACY
+    KEY_FORMAT_MAGIC = b"RNSPQ1"
+    KEY_FORMAT_VERSION = 1
+    PQ_KEM_ALGORITHM = PQCrypto.MLKEM_ALGORITHM
+    PQ_SIG_ALGORITHM = PQCrypto.MLDSA_ALGORITHM
+    PQ_KEM_PUBLIC_SIZE = PQCrypto.MLKEM_PUBLIC_KEY_SIZE
+    PQ_KEM_PRIVATE_SIZE = PQCrypto.MLKEM_PRIVATE_KEY_SIZE
+    PQ_KEM_CIPHERTEXT_SIZE = PQCrypto.MLKEM_CIPHERTEXT_SIZE
+    PQ_SIG_PUBLIC_SIZE = PQCrypto.MLDSA_PUBLIC_KEY_SIZE
+    PQ_SIG_PRIVATE_SIZE = PQCrypto.MLDSA_PRIVATE_KEY_SIZE
+    PQ_SIG_SIGNATURE_SIZE = PQCrypto.MLDSA_SIGNATURE_SIZE
+    CRYPTO_MODE = CRYPTO_DEFAULT
+    @staticmethod
+    def set_crypto_mode(mode):
+        if mode not in [Identity.CRYPTO_LEGACY, Identity.CRYPTO_HYBRID, Identity.CRYPTO_PQ]:
+            raise ValueError("Unknown identity crypto mode: "+str(mode))
+        if mode != Identity.CRYPTO_LEGACY and not RNS.Cryptography.pq_available():
+            raise RuntimeError(f"Crypto mode '{mode}' requires ML-KEM-768 and ML-DSA-65 capability")
+        Identity.CRYPTO_MODE = mode
+
+    @staticmethod
+    def _is_hybrid_mode(mode=None):
+        if mode == None:
+            mode = Identity.CRYPTO_MODE
+        return mode == Identity.CRYPTO_HYBRID
+
+    @staticmethod
+    def _is_pq_mode(mode=None):
+        if mode == None:
+            mode = Identity.CRYPTO_MODE
+        return mode in [Identity.CRYPTO_HYBRID, Identity.CRYPTO_PQ]
+
+    @staticmethod
+    def _legacy_private_size():
+        return Identity.KEYSIZE//8
+
+    @staticmethod
+    def _legacy_public_size():
+        return Identity.KEYSIZE//8
+
+    @staticmethod
+    def _legacy_signature_size():
+        return Identity.SIGLENGTH//8
+
+    @staticmethod
+    def _public_key_size(mode=None):
+        if mode == None:
+            mode = Identity.CRYPTO_MODE
+        if mode == Identity.CRYPTO_HYBRID:
+            return Identity._legacy_public_size() + Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE
+        if mode == Identity.CRYPTO_PQ:
+            return Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE
+        if mode == Identity.CRYPTO_LEGACY:
+            return Identity._legacy_public_size()
+        raise ValueError("Unknown identity crypto mode")
+
+    @staticmethod
+    def _private_key_size(mode=None):
+        if mode == None:
+            mode = Identity.CRYPTO_MODE
+        if mode == Identity.CRYPTO_HYBRID:
+            return Identity._legacy_private_size() + Identity.PQ_KEM_PRIVATE_SIZE + Identity.PQ_SIG_PRIVATE_SIZE
+        if mode == Identity.CRYPTO_PQ:
+            return Identity.PQ_KEM_PRIVATE_SIZE + Identity.PQ_SIG_PRIVATE_SIZE
+        if mode == Identity.CRYPTO_LEGACY:
+            return Identity._legacy_private_size()
+        raise ValueError("Unknown identity crypto mode")
+
+    @staticmethod
+    def _signature_size(mode=None):
+        if mode == None:
+            mode = Identity.CRYPTO_MODE
+        if mode == Identity.CRYPTO_HYBRID:
+            return Identity._legacy_signature_size() + Identity.PQ_SIG_SIGNATURE_SIZE
+        if mode == Identity.CRYPTO_PQ:
+            return Identity.PQ_SIG_SIGNATURE_SIZE
+        if mode == Identity.CRYPTO_LEGACY:
+            return Identity._legacy_signature_size()
+        raise ValueError("Unknown identity crypto mode")
+
+    @staticmethod
+    def split_signature(mode, signature):
+        """Return the mode-specific signature components or reject it."""
+        signature = bytes(signature)
+        if mode == Identity.CRYPTO_LEGACY:
+            if len(signature) != Identity._legacy_signature_size():
+                raise ValueError("Invalid legacy signature length")
+            return {"classical": signature}
+        if mode == Identity.CRYPTO_PQ:
+            if len(signature) != Identity.PQ_SIG_SIGNATURE_SIZE:
+                raise ValueError("Invalid PQ signature length")
+            return {"pq": signature}
+        if mode == Identity.CRYPTO_HYBRID:
+            classical_size = Identity._legacy_signature_size()
+            if len(signature) != classical_size + Identity.PQ_SIG_SIGNATURE_SIZE:
+                raise ValueError("Invalid hybrid signature length")
+            return {"classical": signature[:classical_size], "pq": signature[classical_size:]}
+        raise ValueError("Unknown identity crypto mode")
+
+    @staticmethod
+    def _serialize_key_bundle(mode, public_key=None, private_key=None):
+        payload = {"version": Identity.KEY_FORMAT_VERSION, "mode": mode,
+                   "algorithms": {"kem": Identity.PQ_KEM_ALGORITHM, "sig": Identity.PQ_SIG_ALGORITHM}}
+        if public_key != None:
+            payload["public_key"] = public_key
+        if private_key != None:
+            payload["private_key"] = private_key
+        return Identity.KEY_FORMAT_MAGIC + umsgpack.packb(payload)
+
+    @staticmethod
+    def _deserialize_key_bundle(data):
+        if type(data) != bytes or not data.startswith(Identity.KEY_FORMAT_MAGIC):
+            return None
+        payload = umsgpack.unpackb(data[len(Identity.KEY_FORMAT_MAGIC):])
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid identity key bundle")
+        if payload.get("version") != Identity.KEY_FORMAT_VERSION:
+            raise ValueError("Unsupported identity key bundle version")
+        mode = payload.get("mode")
+        if mode not in [Identity.CRYPTO_PQ, Identity.CRYPTO_HYBRID]:
+            raise ValueError("Tagged bundles are only valid for PQ or hybrid identities")
+        algorithms = payload.get("algorithms")
+        if algorithms != {"kem": Identity.PQ_KEM_ALGORITHM, "sig": Identity.PQ_SIG_ALGORITHM}:
+            raise ValueError("Unsupported PQ algorithms in identity key bundle")
+        allowed = {"version", "mode", "algorithms", "public_key", "private_key"}
+        if set(payload) - allowed:
+            raise ValueError("Unknown identity key bundle fields")
+        return payload
+
+    @staticmethod
+    def _validate_bundle_fields(payload, private=False):
+        mode = payload["mode"]
+        public = payload.get("public_key")
+        secret = payload.get("private_key")
+        if not isinstance(public, dict) or set(public) != {"classical", "classical_sig", "pq", "pq_sig"}:
+            raise ValueError("Invalid public key bundle fields")
+        expected_public = {
+            "classical": Identity._legacy_public_size() if mode == Identity.CRYPTO_HYBRID else None,
+            "classical_sig": Identity._legacy_signature_size() if mode == Identity.CRYPTO_HYBRID else None,
+            "pq": Identity.PQ_KEM_PUBLIC_SIZE,
+            "pq_sig": Identity.PQ_SIG_PUBLIC_SIZE,
+        }
+        for name, size in expected_public.items():
+            value = public[name]
+            if size is None:
+                if value is not None:
+                    raise ValueError(f"Unexpected {name} key component")
+            elif not isinstance(value, bytes) or len(value) != size:
+                raise ValueError(f"Invalid {name} public component")
+        if private:
+            if not isinstance(secret, dict) or set(secret) != {"classical", "classical_sig", "pq", "pq_sig"}:
+                raise ValueError("Invalid private key bundle fields")
+            expected_private = {
+                "classical": Identity._legacy_private_size()//2 if mode == Identity.CRYPTO_HYBRID else None,
+                "classical_sig": Identity._legacy_private_size()//2 if mode == Identity.CRYPTO_HYBRID else None,
+                "pq": Identity.PQ_KEM_PRIVATE_SIZE,
+                "pq_sig": Identity.PQ_SIG_PRIVATE_SIZE,
+            }
+            for name, size in expected_private.items():
+                value = secret[name]
+                if size is None:
+                    if value is not None:
+                        raise ValueError(f"Unexpected {name} private component")
+                elif not isinstance(value, bytes) or len(value) != size:
+                    raise ValueError(f"Invalid {name} private component")
+        elif "private_key" in payload:
+            raise ValueError("Public key bundle cannot contain private key material")
     @staticmethod
     def remember(packet_hash, destination_hash, public_key, app_data = None):
-        if len(public_key) != Identity.KEYSIZE//8:
+        valid_sizes = [Identity._legacy_public_size(),
+                       Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE,
+                       Identity._legacy_public_size() + Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE]
+        if len(public_key) not in valid_sizes:
             raise TypeError("Can't remember "+RNS.prettyhexrep(destination_hash)+", the public key size of "+str(len(public_key))+" is not valid.", RNS.LOG_ERROR)
         else:
             with Identity.known_destinations_lock:
@@ -221,14 +396,23 @@ class Identity:
                     loaded_known_destinations = umsgpack.load(file)
 
                 Identity.known_destinations = {}
-                for known_destination in loaded_known_destinations:
-                    if len(known_destination) == RNS.Reticulum.TRUNCATED_HASHLENGTH//8:
-                        if len(loaded_known_destinations[known_destination]) < 5:
-                            e = loaded_known_destinations[known_destination]
-                            loaded_known_destinations[known_destination] = [e[0], e[1], e[2], e[3], 0]
-
-                        with Identity.known_destinations_lock:
-                            Identity.known_destinations[known_destination] = loaded_known_destinations[known_destination]
+                for known_destination, entry in loaded_known_destinations.items():
+                    if len(known_destination) != RNS.Reticulum.TRUNCATED_HASHLENGTH//8:
+                        continue
+                    if not isinstance(entry, (list, tuple)) or len(entry) < 4:
+                        continue
+                    if not isinstance(entry[2], bytes):
+                        continue
+                    candidate = Identity(create_keys=False)
+                    if not candidate.load_public_key(entry[2]):
+                        continue
+                    if not isinstance(entry[3], (bytes, type(None))):
+                        continue
+                    normalized = list(entry[:5])
+                    if len(normalized) < 5:
+                        normalized.append(0)
+                    with Identity.known_destinations_lock:
+                        Identity.known_destinations[known_destination] = normalized
 
                 RNS.log(f"Loaded {len(Identity.known_destinations)} known destination from storage in {RNS.prettyshorttime(time.time()-st)}", RNS.LOG_VERBOSE)
 
@@ -508,105 +692,76 @@ class Identity:
             return None
 
     @staticmethod
+    def parse_announce(data, context_flag=0, mode=None):
+        """Parse a complete canonical announce payload without global-mode guesses."""
+        if mode is None:
+            candidates = [Identity.CRYPTO_HYBRID, Identity.CRYPTO_PQ, Identity.CRYPTO_LEGACY]
+        else:
+            candidates = [mode]
+        ratchet_size = Identity.RATCHETSIZE//8 if context_flag == RNS.Packet.FLAG_SET else 0
+        name_hash_len = Identity.NAME_HASH_LENGTH//8
+        for candidate in candidates:
+            key_size = Identity._public_key_size(candidate)
+            sig_size = Identity._signature_size(candidate)
+            minimum = key_size + name_hash_len + 10 + ratchet_size + sig_size
+            if len(data) < minimum:
+                continue
+            public_key = data[:key_size]
+            offset = key_size
+            name_hash = data[offset:offset+name_hash_len]
+            offset += name_hash_len
+            random_hash = data[offset:offset+10]
+            offset += 10
+            ratchet = data[offset:offset+ratchet_size]
+            offset += ratchet_size
+            signature = data[offset:offset+sig_size]
+            offset += sig_size
+            return {"mode": candidate, "public_key": public_key, "name_hash": name_hash,
+                    "random_hash": random_hash, "ratchet": ratchet,
+                    "signature": signature, "app_data": data[offset:]}
+        raise ValueError("Announce payload does not match a supported identity layout")
+
+    @staticmethod
     def validate_announce(packet, only_validate_signature=False, signal_blackholed=False):
         try:
-            if packet.packet_type == RNS.Packet.ANNOUNCE:
-                keysize       = Identity.KEYSIZE//8
-                ratchetsize   = Identity.RATCHETSIZE//8
-                name_hash_len = Identity.NAME_HASH_LENGTH//8
-                sig_len       = Identity.SIGLENGTH//8
-                destination_hash = packet.destination_hash
+            if packet.packet_type != RNS.Packet.ANNOUNCE:
+                return False
+            destination_hash = packet.destination_hash
+            parsed = Identity.parse_announce(packet.data, packet.context_flag,
+                                             getattr(packet, "announce_mode", None))
+            public_key = parsed["public_key"]
+            announced_identity = Identity(create_keys=False)
+            if not announced_identity.load_public_key(public_key):
+                return False
 
-                # Get public key bytes from announce
-                public_key = packet.data[:keysize]
+            if len(RNS.Transport.blackholed_identities) > 0 and announced_identity.hash in RNS.Transport.blackholed_identities:
+                RNS.log(f"Invalidated and dropped announce from blackholed identity {RNS.prettyhexrep(announced_identity.hash)}", RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
+                if signal_blackholed:
+                    return "blackholed"
+                return False
 
-                # If the packet context flag is set,
-                # this announce contains a new ratchet
-                if packet.context_flag == RNS.Packet.FLAG_SET:
-                    name_hash   = packet.data[keysize:keysize+name_hash_len ]
-                    random_hash = packet.data[keysize+name_hash_len:keysize+name_hash_len+10]
-                    ratchet     = packet.data[keysize+name_hash_len+10:keysize+name_hash_len+10+ratchetsize]
-                    signature   = packet.data[keysize+name_hash_len+10+ratchetsize:keysize+name_hash_len+10+ratchetsize+sig_len]
-                    app_data    = b""
-                    if len(packet.data) > keysize+name_hash_len+10+sig_len+ratchetsize:
-                        app_data = packet.data[keysize+name_hash_len+10+sig_len+ratchetsize:]
-
-                # If the packet context flag is not set,
-                # this announce does not contain a ratchet
-                else:
-                    ratchet     = b""
-                    name_hash   = packet.data[keysize:keysize+name_hash_len]
-                    random_hash = packet.data[keysize+name_hash_len:keysize+name_hash_len+10]
-                    signature   = packet.data[keysize+name_hash_len+10:keysize+name_hash_len+10+sig_len]
-                    app_data    = b""
-                    if len(packet.data) > keysize+name_hash_len+10+sig_len:
-                        app_data = packet.data[keysize+name_hash_len+10+sig_len:]
-
-                signed_data = destination_hash+public_key+name_hash+random_hash+ratchet+app_data
-
-                if not len(packet.data) > Identity.KEYSIZE//8+Identity.NAME_HASH_LENGTH//8+10+Identity.SIGLENGTH//8:
-                    app_data = None
-
-                announced_identity = Identity(create_keys=False)
-                announced_identity.load_public_key(public_key)
-
-                if len(RNS.Transport.blackholed_identities) > 0:
-                    if announced_identity.hash in RNS.Transport.blackholed_identities:
-                        RNS.log(f"Invalidated and dropped announce from blackholed identity {RNS.prettyhexrep(announced_identity.hash)}", RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
-                        if signal_blackholed: return "blackholed"
-                        else:                 return False
-
-                if announced_identity.pub != None and (packet.announce_signature_validated or announced_identity.validate(signature, signed_data)):
-                    packet.announce_signature_validated = True
-                    if only_validate_signature:
-                        del announced_identity
-                        return True
-
-                    hash_material = name_hash+announced_identity.hash
-                    expected_hash = RNS.Identity.full_hash(hash_material)[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
-
-                    if destination_hash == expected_hash:
-                        # Check if we already have a public key for this destination
-                        # and make sure the public key is not different.
-                        if destination_hash in Identity.known_destinations:
-                            if public_key != Identity.known_destinations[destination_hash][2]:
-                                # In reality, this should never occur, but in the odd case
-                                # that someone manages a hash collision, we reject the announce.
-                                RNS.log("Received announce with valid signature and destination hash, but announced public key does not match already known public key.", RNS.LOG_CRITICAL)
-                                RNS.log("This may indicate an attempt to modify network paths, or a random hash collision. The announce was rejected.", RNS.LOG_CRITICAL)
-                                return False
-
-                        RNS.Identity.remember(packet.get_hash(), destination_hash, public_key, app_data)
-                        del announced_identity
-
-                        if packet.rssi != None or packet.snr != None:
-                            signal_str = " ["
-                            if packet.rssi != None:
-                                signal_str += "RSSI "+str(packet.rssi)+"dBm"
-                                if packet.snr != None: signal_str += ", "
-                            if packet.snr != None: signal_str += "SNR "+str(packet.snr)+"dB"
-                            signal_str += "]"
-
-                        else: signal_str = ""
-
-                        if hasattr(packet, "transport_id") and packet.transport_id != None:
-                            RNS.log("Valid announce for "+RNS.prettyhexrep(destination_hash)+" "+str(packet.hops)+" hops away, received via "+RNS.prettyhexrep(packet.transport_id)+" on "+str(packet.receiving_interface)+signal_str, RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
-                        else:
-                            RNS.log("Valid announce for "+RNS.prettyhexrep(destination_hash)+" "+str(packet.hops)+" hops away, received on "+str(packet.receiving_interface)+signal_str, RNS.LOG_EXTREME) if RNS.sl(RNS.LOG_EXTREME) else None
-
-                        if ratchet: Identity._remember_ratchet(destination_hash, ratchet)
-
-                        return True
-
-                    else:
-                        RNS.log("Received invalid announce for "+RNS.prettyhexrep(destination_hash)+": Destination mismatch.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-                        return False
-
-                else:
-                    RNS.log("Received invalid announce for "+RNS.prettyhexrep(destination_hash)+": Invalid signature.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-                    del announced_identity
+            signed_data = (destination_hash + public_key + parsed["name_hash"] +
+                           parsed["random_hash"] + parsed["ratchet"] + parsed["app_data"])
+            if not announced_identity.has_public_key() or (packet.announce_signature_validated or announced_identity.validate(parsed["signature"], signed_data)):
+                packet.announce_signature_validated = True
+                if only_validate_signature:
+                    return True
+                expected_hash = RNS.Identity.full_hash(parsed["name_hash"]+announced_identity.hash)[:RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
+                if destination_hash != expected_hash:
+                    RNS.log("Received invalid announce for "+RNS.prettyhexrep(destination_hash)+": Destination mismatch.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                     return False
-        
+                if destination_hash in Identity.known_destinations and public_key != Identity.known_destinations[destination_hash][2]:
+                    RNS.log("Received announce with valid signature and destination hash, but announced public key does not match already known public key.", RNS.LOG_CRITICAL)
+                    RNS.log("This may indicate an attempt to modify network paths, or a random hash collision. The announce was rejected.", RNS.LOG_CRITICAL)
+                    return False
+                Identity.remember(packet.packet_hash if packet.context == RNS.Packet.PQ_FRAGMENT else packet.get_hash(),
+                                  destination_hash, public_key, parsed["app_data"])
+                if parsed["ratchet"]:
+                    Identity._remember_ratchet(destination_hash, parsed["ratchet"])
+                return True
+
+            RNS.log("Received invalid announce for "+RNS.prettyhexrep(destination_hash)+": Invalid signature.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+            return False
         except Exception as e:
             RNS.log("Error occurred while validating announce. The contained exception was: "+str(e), RNS.LOG_ERROR)
             return False
@@ -663,7 +818,7 @@ class Identity:
         """
         try:
             with open(path, "wb") as key_file:
-                key_file.write(self.get_private_key())
+                key_file.write(self.serialize_private_key())
                 return True
             return False
         except Exception as e:
@@ -679,7 +834,7 @@ class Identity:
         """
         try:
             with open(path, "wb") as key_file:
-                key_file.write(self.get_public_key())
+                key_file.write(self.serialize_public_key())
                 return True
             return False
         except Exception as e:
@@ -688,15 +843,25 @@ class Identity:
 
     def __init__(self,create_keys=True):
         # Initialize keys to none
+        self.crypto_mode   = Identity.CRYPTO_MODE
+
         self.prv           = None
         self.prv_bytes     = None
         self.sig_prv       = None
         self.sig_prv_bytes = None
+        self.pq_prv        = None
+        self.pq_prv_bytes   = None
+        self.pq_sig_prv    = None
+        self.pq_sig_prv_bytes = None
 
         self.pub           = None
         self.pub_bytes     = None
         self.sig_pub       = None
         self.sig_pub_bytes = None
+        self.pq_pub        = None
+        self.pq_pub_bytes   = None
+        self.pq_sig_pub    = None
+        self.pq_sig_pub_bytes = None
 
         self.hash          = None
         self.hexhash       = None
@@ -705,81 +870,262 @@ class Identity:
             self.create_keys()
 
     def create_keys(self):
-        self.prv           = X25519PrivateKey.generate()
-        self.prv_bytes     = self.prv.private_bytes()
+        mode = self.crypto_mode
+        if mode != Identity.CRYPTO_LEGACY and not RNS.Cryptography.pq_available():
+            raise RuntimeError(f"Crypto mode '{mode}' requires ML-KEM-768 and ML-DSA-65 capability")
 
-        self.sig_prv       = Ed25519PrivateKey.generate()
-        self.sig_prv_bytes = self.sig_prv.private_bytes()
+        self.prv = None
+        self.prv_bytes = None
+        self.sig_prv = None
+        self.sig_prv_bytes = None
+        self.pq_prv = None
+        self.pq_prv_bytes = None
+        self.pq_sig_prv = None
+        self.pq_sig_prv_bytes = None
+        self.pub = None
+        self.pub_bytes = None
+        self.sig_pub = None
+        self.sig_pub_bytes = None
+        self.pq_pub = None
+        self.pq_pub_bytes = None
+        self.pq_sig_pub = None
+        self.pq_sig_pub_bytes = None
 
-        self.pub           = self.prv.public_key()
-        self.pub_bytes     = self.pub.public_bytes()
+        if mode == Identity.CRYPTO_PQ:
+            self.pq_prv       = MLKEMPrivateKey.generate()
+            self.pq_prv_bytes = self.pq_prv.private_bytes()
+            self.pq_pub       = self.pq_prv.public_key()
+            self.pq_pub_bytes  = self.pq_pub.public_bytes()
 
-        self.sig_pub       = self.sig_prv.public_key()
-        self.sig_pub_bytes = self.sig_pub.public_bytes()
+            self.pq_sig_prv       = MLDSAPrivateKey.generate()
+            self.pq_sig_prv_bytes  = self.pq_sig_prv.private_bytes()
+            self.pq_sig_pub        = self.pq_sig_prv.public_key()
+            self.pq_sig_pub_bytes  = self.pq_sig_pub.public_bytes()
 
-        self.update_hashes()
+            self.prv = None
+            self.prv_bytes = None
+            self.sig_prv = None
+            self.sig_prv_bytes = None
+            self.pub = None
+            self.pub_bytes = None
+            self.sig_pub = None
+            self.sig_pub_bytes = None
 
-        RNS.log("Identity keys created for "+RNS.prettyhexrep(self.hash), RNS.LOG_VERBOSE)
+        else:
+            self.prv           = X25519PrivateKey.generate()
+            self.prv_bytes     = self.prv.private_bytes()
 
-    def get_private_key(self):
-        """
-        :returns: The private key as *bytes*
-        """
-        if self.prv_bytes and self.sig_prv_bytes: return self.prv_bytes+self.sig_prv_bytes
-        else:                                     return None
+            self.sig_prv       = Ed25519PrivateKey.generate()
+            self.sig_prv_bytes = self.sig_prv.private_bytes()
 
-    def get_public_key(self):
-        """
-        :returns: The public key as *bytes*
-        """
-        if self.pub_bytes and self.sig_pub_bytes: return self.pub_bytes+self.sig_pub_bytes
-        else:                                     return None
-
-    def load_private_key(self, prv_bytes):
-        """
-        Load a private key into the instance.
-
-        :param prv_bytes: The private key as *bytes*.
-        :returns: True if the key was loaded, otherwise False.
-        """
-        try:
-            self.prv_bytes     = prv_bytes[:Identity.KEYSIZE//8//2]
-            self.prv           = X25519PrivateKey.from_private_bytes(self.prv_bytes)
-            self.sig_prv_bytes = prv_bytes[Identity.KEYSIZE//8//2:]
-            self.sig_prv       = Ed25519PrivateKey.from_private_bytes(self.sig_prv_bytes)
-            
             self.pub           = self.prv.public_key()
             self.pub_bytes     = self.pub.public_bytes()
 
             self.sig_pub       = self.sig_prv.public_key()
             self.sig_pub_bytes = self.sig_pub.public_bytes()
 
-            self.update_hashes()
+            if mode == Identity.CRYPTO_HYBRID:
+                self.pq_prv       = MLKEMPrivateKey.generate()
+                self.pq_prv_bytes = self.pq_prv.private_bytes()
+                self.pq_pub       = self.pq_prv.public_key()
+                self.pq_pub_bytes  = self.pq_pub.public_bytes()
 
-            return True
+                self.pq_sig_prv       = MLDSAPrivateKey.generate()
+                self.pq_sig_prv_bytes  = self.pq_sig_prv.private_bytes()
+                self.pq_sig_pub        = self.pq_sig_prv.public_key()
+                self.pq_sig_pub_bytes  = self.pq_sig_pub.public_bytes()
+            else:
+                self.pq_prv = None
+                self.pq_prv_bytes = None
+                self.pq_pub = None
+                self.pq_pub_bytes = None
+                self.pq_sig_prv = None
+                self.pq_sig_prv_bytes = None
+                self.pq_sig_pub = None
+                self.pq_sig_pub_bytes = None
 
+        self.update_hashes()
+
+        RNS.log("Identity keys created for "+RNS.prettyhexrep(self.hash), RNS.LOG_VERBOSE)
+
+    def get_private_key(self):
+        """Return the canonical private identity material."""
+        if self.crypto_mode == Identity.CRYPTO_LEGACY and self.prv_bytes and self.sig_prv_bytes:
+            return self.prv_bytes+self.sig_prv_bytes
+        if self.crypto_mode in [Identity.CRYPTO_PQ, Identity.CRYPTO_HYBRID] and self.pq_prv_bytes and self.pq_sig_prv_bytes:
+            return self.serialize_private_key()
+        return None
+
+    def serialize_private_key(self):
+        if self.crypto_mode == Identity.CRYPTO_LEGACY:
+            return self.get_private_key()
+        payload = {"mode": self.crypto_mode,
+                   "public_key": self._public_public_bundle(),
+                   "private_key": self._public_private_bundle()}
+        return Identity._serialize_key_bundle(self.crypto_mode, payload["public_key"], payload["private_key"])
+
+    def get_public_key(self):
+        """Return the raw public bundle used in identity/destination hashes."""
+        if self.crypto_mode == Identity.CRYPTO_LEGACY and self.pub_bytes and self.sig_pub_bytes:
+            return self.pub_bytes+self.sig_pub_bytes
+        if self.crypto_mode == Identity.CRYPTO_PQ and self.pq_pub_bytes and self.pq_sig_pub_bytes:
+            return self.pq_pub_bytes+self.pq_sig_pub_bytes
+        if self.crypto_mode == Identity.CRYPTO_HYBRID and self.pub_bytes and self.sig_pub_bytes and self.pq_pub_bytes and self.pq_sig_pub_bytes:
+            return self.pub_bytes+self.sig_pub_bytes+self.pq_pub_bytes+self.pq_sig_pub_bytes
+        return None
+
+    def serialize_public_key(self):
+        if self.crypto_mode == Identity.CRYPTO_LEGACY:
+            return self.get_public_key()
+        return Identity._serialize_key_bundle(self.crypto_mode, self._public_public_bundle())
+
+    def _public_public_bundle(self):
+        return {"classical": self.pub_bytes, "classical_sig": self.sig_pub_bytes,
+                "pq": self.pq_pub_bytes, "pq_sig": self.pq_sig_pub_bytes}
+
+    def _public_private_bundle(self):
+        return {"classical": self.prv_bytes, "classical_sig": self.sig_prv_bytes,
+                "pq": self.pq_prv_bytes, "pq_sig": self.pq_sig_prv_bytes}
+
+    def has_private_key(self):
+        if self.crypto_mode == Identity.CRYPTO_LEGACY:
+            return self.prv is not None and self.sig_prv is not None
+        if self.crypto_mode == Identity.CRYPTO_PQ:
+            return self.pq_prv is not None and self.pq_sig_prv is not None
+        return all(key is not None for key in (self.prv, self.sig_prv, self.pq_prv, self.pq_sig_prv))
+
+    def has_public_key(self):
+        if self.crypto_mode == Identity.CRYPTO_LEGACY:
+            return self.pub is not None and self.sig_pub is not None
+        if self.crypto_mode == Identity.CRYPTO_PQ:
+            return self.pq_pub is not None and self.pq_sig_pub is not None
+        return all(key is not None for key in (self.pub, self.sig_pub, self.pq_pub, self.pq_sig_pub))
+    def _public_public_bundle(self):
+        return {"classical": self.pub_bytes, "classical_sig": self.sig_pub_bytes,
+                "pq": self.pq_pub_bytes, "pq_sig": self.pq_sig_pub_bytes}
+
+    def _public_private_bundle(self):
+        return {"classical": self.prv_bytes, "classical_sig": self.sig_prv_bytes,
+                "pq": self.pq_prv_bytes, "pq_sig": self.pq_sig_prv_bytes}
+
+    def _load_tagged_bundle(self, payload, private):
+        Identity._validate_bundle_fields(payload, private=private)
+        mode = payload["mode"]
+        public_key = payload["public_key"]
+        secret = payload.get("private_key") if private else None
+        self.crypto_mode = mode
+        self.pub_bytes = public_key["classical"]
+        self.sig_pub_bytes = public_key["classical_sig"]
+        self.pq_pub_bytes = public_key["pq"]
+        self.pq_sig_pub_bytes = public_key["pq_sig"]
+        self.pub = X25519PublicKey.from_public_bytes(self.pub_bytes) if self.pub_bytes else None
+        self.sig_pub = Ed25519PublicKey.from_public_bytes(self.sig_pub_bytes) if self.sig_pub_bytes else None
+        self.pq_pub = MLKEMPublicKey.from_public_bytes(self.pq_pub_bytes)
+        self.pq_sig_pub = MLDSAPublicKey.from_public_bytes(self.pq_sig_pub_bytes)
+        if private:
+            self.prv_bytes = secret["classical"]
+            self.sig_prv_bytes = secret["classical_sig"]
+            self.pq_prv_bytes = secret["pq"]
+            self.pq_sig_prv_bytes = secret["pq_sig"]
+            self.prv = X25519PrivateKey.from_private_bytes(self.prv_bytes) if self.prv_bytes else None
+            self.sig_prv = Ed25519PrivateKey.from_private_bytes(self.sig_prv_bytes) if self.sig_prv_bytes else None
+            self.pq_prv = MLKEMPrivateKey.from_private_bytes(self.pq_prv_bytes, public_bytes=self.pq_pub_bytes)
+            self.pq_sig_prv = MLDSAPrivateKey.from_private_bytes(self.pq_sig_prv_bytes, public_bytes=self.pq_sig_pub_bytes)
+        else:
+            self.prv = self.prv_bytes = self.sig_prv = self.sig_prv_bytes = None
+            self.pq_prv = self.pq_prv_bytes = self.pq_sig_prv = self.pq_sig_prv_bytes = None
+        self.update_hashes()
+
+    def _commit_key_state(self, source):
+        for name in ("crypto_mode", "prv", "prv_bytes", "sig_prv", "sig_prv_bytes",
+                     "pq_prv", "pq_prv_bytes", "pq_sig_prv", "pq_sig_prv_bytes",
+                     "pub", "pub_bytes", "sig_pub", "sig_pub_bytes",
+                     "pq_pub", "pq_pub_bytes", "pq_sig_pub", "pq_sig_pub_bytes",
+                     "hash", "hexhash"):
+            setattr(self, name, getattr(source, name))
+
+    def load_private_key(self, prv_bytes):
+        try:
+            payload = Identity._deserialize_key_bundle(prv_bytes)
+            if payload is not None:
+                candidate = Identity(create_keys=False)
+                candidate._load_tagged_bundle(payload, private=True)
+                self._commit_key_state(candidate)
+                return True
+
+            if not isinstance(prv_bytes, bytes):
+                return False
+            if len(prv_bytes) == Identity._legacy_private_size():
+                candidate = Identity(create_keys=False)
+                candidate.crypto_mode = Identity.CRYPTO_LEGACY
+                candidate.prv_bytes = prv_bytes[:Identity._legacy_private_size()//2]
+                candidate.sig_prv_bytes = prv_bytes[Identity._legacy_private_size()//2:]
+                candidate.prv = X25519PrivateKey.from_private_bytes(candidate.prv_bytes)
+                candidate.sig_prv = Ed25519PrivateKey.from_private_bytes(candidate.sig_prv_bytes)
+                candidate.pub = candidate.prv.public_key()
+                candidate.pub_bytes = candidate.pub.public_bytes()
+                candidate.sig_pub = candidate.sig_prv.public_key()
+                candidate.sig_pub_bytes = candidate.sig_pub.public_bytes()
+                candidate.update_hashes()
+                self._commit_key_state(candidate)
+                return True
+
+            # Raw PQ private bytes are intentionally rejected: they cannot derive
+            # the public components required by the identity hash.
+            return False
         except Exception as e:
             RNS.log(f"Failed to load identity key, the contained exception was: {e}", RNS.LOG_ERROR)
             return False
 
     def load_public_key(self, pub_bytes):
-        """
-        Load a public key into the instance.
-
-        :param pub_bytes: The public key as *bytes*.
-        :returns: True if the key was loaded, otherwise False.
-        """
         try:
-            self.pub_bytes     = pub_bytes[:Identity.KEYSIZE//8//2]
-            self.sig_pub_bytes = pub_bytes[Identity.KEYSIZE//8//2:]
+            payload = Identity._deserialize_key_bundle(pub_bytes)
+            if payload is not None:
+                candidate = Identity(create_keys=False)
+                candidate._load_tagged_bundle(payload, private=False)
+                self._commit_key_state(candidate)
+                return True
 
-            self.pub           = X25519PublicKey.from_public_bytes(self.pub_bytes)
-            self.sig_pub       = Ed25519PublicKey.from_public_bytes(self.sig_pub_bytes)
-
-            self.update_hashes()
-
-            return True
-
+            if not isinstance(pub_bytes, bytes):
+                return False
+            if len(pub_bytes) == Identity._legacy_public_size():
+                candidate = Identity(create_keys=False)
+                candidate.crypto_mode = Identity.CRYPTO_LEGACY
+                candidate.pub_bytes = pub_bytes[:Identity._legacy_public_size()//2]
+                candidate.sig_pub_bytes = pub_bytes[Identity._legacy_public_size()//2:]
+                candidate.pub = X25519PublicKey.from_public_bytes(candidate.pub_bytes)
+                candidate.sig_pub = Ed25519PublicKey.from_public_bytes(candidate.sig_pub_bytes)
+                candidate.update_hashes()
+                self._commit_key_state(candidate)
+                return True
+            if len(pub_bytes) == Identity._public_key_size(Identity.CRYPTO_PQ):
+                candidate = Identity(create_keys=False)
+                candidate.crypto_mode = Identity.CRYPTO_PQ
+                candidate.pq_pub_bytes = pub_bytes[:Identity.PQ_KEM_PUBLIC_SIZE]
+                candidate.pq_sig_pub_bytes = pub_bytes[Identity.PQ_KEM_PUBLIC_SIZE:]
+                candidate.pq_pub = MLKEMPublicKey.from_public_bytes(candidate.pq_pub_bytes)
+                candidate.pq_sig_pub = MLDSAPublicKey.from_public_bytes(candidate.pq_sig_pub_bytes)
+                candidate.update_hashes()
+                self._commit_key_state(candidate)
+                return True
+            if len(pub_bytes) == Identity._public_key_size(Identity.CRYPTO_HYBRID):
+                candidate = Identity(create_keys=False)
+                candidate.crypto_mode = Identity.CRYPTO_HYBRID
+                legacy = Identity._legacy_public_size()
+                candidate.pub_bytes = pub_bytes[:legacy//2]
+                candidate.sig_pub_bytes = pub_bytes[legacy//2:legacy]
+                offset = legacy
+                candidate.pq_pub_bytes = pub_bytes[offset:offset+Identity.PQ_KEM_PUBLIC_SIZE]
+                offset += Identity.PQ_KEM_PUBLIC_SIZE
+                candidate.pq_sig_pub_bytes = pub_bytes[offset:]
+                candidate.pub = X25519PublicKey.from_public_bytes(candidate.pub_bytes)
+                candidate.sig_pub = Ed25519PublicKey.from_public_bytes(candidate.sig_pub_bytes)
+                candidate.pq_pub = MLKEMPublicKey.from_public_bytes(candidate.pq_pub_bytes)
+                candidate.pq_sig_pub = MLDSAPublicKey.from_public_bytes(candidate.pq_sig_pub_bytes)
+                candidate.update_hashes()
+                self._commit_key_state(candidate)
+                return True
+            return False
         except Exception as e:
             RNS.log(f"Error while loading public key, the contained exception was: {e}", RNS.LOG_ERROR)
             return False
@@ -812,31 +1158,67 @@ class Identity:
         :returns: Ciphertext token as *bytes*.
         :raises: *KeyError* if the instance does not hold a public key.
         """
-        if self.pub != None:
-            ephemeral_key = X25519PrivateKey.generate()
-            ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes()
+        try:
+            if self.crypto_mode == Identity.CRYPTO_PQ:
+                if self.pq_pub == None:
+                    raise KeyError("Encryption failed because identity does not hold a public key")
+                pq_ciphertext, pq_shared = self.pq_pub.encapsulate()
+                derived_key = RNS.Cryptography.hkdf(length=Identity.DERIVED_KEY_LENGTH,
+                                                   derive_from=pq_shared,
+                                                   salt=self.get_salt(),
+                                                   context=self.get_context())
+                token = Token(derived_key)
+                ciphertext = token.encrypt(plaintext)
+                return pq_ciphertext + ciphertext
 
-            if ratchet != None:
-                target_public_key = X25519PublicKey.from_public_bytes(ratchet)
+            if self.crypto_mode == Identity.CRYPTO_HYBRID:
+                if self.pub == None or self.pq_pub == None:
+                    raise KeyError("Encryption failed because identity does not hold a public key")
+                ephemeral_key = X25519PrivateKey.generate()
+                ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes()
+                if ratchet != None:
+                    target_public_key = X25519PublicKey.from_public_bytes(ratchet)
+                else:
+                    target_public_key = self.pub
+                classical_shared = ephemeral_key.exchange(target_public_key)
+                pq_ciphertext, pq_shared = self.pq_pub.encapsulate()
+                shared_key = classical_shared + pq_shared
+                derived_key = RNS.Cryptography.hkdf(length=Identity.DERIVED_KEY_LENGTH,
+                                                   derive_from=shared_key,
+                                                   salt=self.get_salt(),
+                                                   context=self.get_context())
+                token = Token(derived_key)
+                ciphertext = token.encrypt(plaintext)
+                return ephemeral_pub_bytes + pq_ciphertext + ciphertext
+
+            if self.pub != None:
+                ephemeral_key = X25519PrivateKey.generate()
+                ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes()
+
+                if ratchet != None:
+                    target_public_key = X25519PublicKey.from_public_bytes(ratchet)
+                else:
+                    target_public_key = self.pub
+
+                shared_key = ephemeral_key.exchange(target_public_key)
+                
+                derived_key = RNS.Cryptography.hkdf(
+                    length=Identity.DERIVED_KEY_LENGTH,
+                    derive_from=shared_key,
+                    salt=self.get_salt(),
+                    context=self.get_context(),
+                )
+
+                token = Token(derived_key)
+                ciphertext = token.encrypt(plaintext)
+                token = ephemeral_pub_bytes+ciphertext
+
+                return token
             else:
-                target_public_key = self.pub
-
-            shared_key = ephemeral_key.exchange(target_public_key)
-            
-            derived_key = RNS.Cryptography.hkdf(
-                length=Identity.DERIVED_KEY_LENGTH,
-                derive_from=shared_key,
-                salt=self.get_salt(),
-                context=self.get_context(),
-            )
-
-            token = Token(derived_key)
-            ciphertext = token.encrypt(plaintext)
-            token = ephemeral_pub_bytes+ciphertext
-
-            return token
-        else:
-            raise KeyError("Encryption failed because identity does not hold a public key")
+                raise KeyError("Encryption failed because identity does not hold a public key")
+        except Exception as e:
+            RNS.log("Encryption by "+RNS.prettyhexrep(self.hash)+" failed: "+str(e), RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+            raise
 
     def __decrypt(self, shared_key, ciphertext):
         derived_key = RNS.Cryptography.hkdf(
@@ -858,90 +1240,122 @@ class Identity:
         :raises: *KeyError* if the instance does not hold a private key.
         """
 
-        if self.prv != None:
-            if len(ciphertext_token) > Identity.KEYSIZE//8//2:
-                plaintext = None
-                try:
-                    peer_pub_bytes = ciphertext_token[:Identity.KEYSIZE//8//2]
-                    peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
-                    ciphertext = ciphertext_token[Identity.KEYSIZE//8//2:]
+        try:
+            if self.crypto_mode == Identity.CRYPTO_PQ:
+                if self.pq_prv == None or len(ciphertext_token) <= Identity.PQ_KEM_CIPHERTEXT_SIZE:
+                    RNS.log("Decryption failed because the token size was invalid.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                    return None
+                pq_ciphertext = ciphertext_token[:Identity.PQ_KEM_CIPHERTEXT_SIZE]
+                ciphertext = ciphertext_token[Identity.PQ_KEM_CIPHERTEXT_SIZE:]
+                shared_key = self.pq_prv.decapsulate(pq_ciphertext)
+                return self.__decrypt(shared_key, ciphertext)
 
-                    if ratchets:
-                        for ratchet in ratchets:
-                            try:
-                                ratchet_prv = X25519PrivateKey.from_private_bytes(ratchet)
-                                ratchet_id = Identity._get_ratchet_id(ratchet_prv.public_key().public_bytes())
-                                shared_key = ratchet_prv.exchange(peer_pub)
-                                plaintext = self.__decrypt(shared_key, ciphertext)
-                                if ratchet_id_receiver:
-                                    ratchet_id_receiver.latest_ratchet_id = ratchet_id
+            if self.crypto_mode == Identity.CRYPTO_HYBRID:
+                classical_len = Identity._legacy_public_size()//2
+                if self.prv == None or self.pq_prv == None or len(ciphertext_token) <= classical_len + Identity.PQ_KEM_CIPHERTEXT_SIZE:
+                    RNS.log("Decryption failed because the token size was invalid.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                    return None
+                peer_pub_bytes = ciphertext_token[:classical_len]
+                peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
+                pq_ciphertext = ciphertext_token[classical_len:classical_len+Identity.PQ_KEM_CIPHERTEXT_SIZE]
+                ciphertext = ciphertext_token[classical_len+Identity.PQ_KEM_CIPHERTEXT_SIZE:]
+                classical_shared = self.prv.exchange(peer_pub)
+                pq_shared = self.pq_prv.decapsulate(pq_ciphertext)
+                return self.__decrypt(classical_shared + pq_shared, ciphertext)
+
+            if self.prv != None:
+                if len(ciphertext_token) > Identity.KEYSIZE//8//2:
+                    plaintext = None
+                    try:
+                        peer_pub_bytes = ciphertext_token[:Identity.KEYSIZE//8//2]
+                        peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
+                        ciphertext = ciphertext_token[Identity.KEYSIZE//8//2:]
+
+                        if ratchets:
+                            for ratchet in ratchets:
+                                try:
+                                    ratchet_prv = X25519PrivateKey.from_private_bytes(ratchet)
+                                    ratchet_id = Identity._get_ratchet_id(ratchet_prv.public_key().public_bytes())
+                                    shared_key = ratchet_prv.exchange(peer_pub)
+                                    plaintext = self.__decrypt(shared_key, ciphertext)
+                                    if ratchet_id_receiver:
+                                        ratchet_id_receiver.latest_ratchet_id = ratchet_id
+                                    
+                                    break
                                 
-                                break
-                            
-                            except Exception as e:
-                                pass
+                                except Exception as e:
+                                    pass
 
-                    if enforce_ratchets and plaintext == None:
-                        RNS.log("Decryption with ratchet enforcement by "+RNS.prettyhexrep(self.hash)+" failed. Dropping packet.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                        if enforce_ratchets and plaintext == None:
+                            RNS.log("Decryption with ratchet enforcement by "+RNS.prettyhexrep(self.hash)+" failed. Dropping packet.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                            if ratchet_id_receiver:
+                                ratchet_id_receiver.latest_ratchet_id = None
+                            return None
+
+                        if plaintext == None:
+                            shared_key = self.prv.exchange(peer_pub)
+                            plaintext = self.__decrypt(shared_key, ciphertext)
+
+                            if ratchet_id_receiver:
+                                ratchet_id_receiver.latest_ratchet_id = None
+
+                    except Exception as e:
+                        RNS.log("Decryption by "+RNS.prettyhexrep(self.hash)+" failed: "+str(e), RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                         if ratchet_id_receiver:
                             ratchet_id_receiver.latest_ratchet_id = None
-                        return None
-
-                    if plaintext == None:
-                        shared_key = self.prv.exchange(peer_pub)
-                        plaintext = self.__decrypt(shared_key, ciphertext)
-
-                        if ratchet_id_receiver:
-                            ratchet_id_receiver.latest_ratchet_id = None
-
-                except Exception as e:
-                    RNS.log("Decryption by "+RNS.prettyhexrep(self.hash)+" failed: "+str(e), RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-                    if ratchet_id_receiver:
-                        ratchet_id_receiver.latest_ratchet_id = None
-                    
-                return plaintext
-            
+                        
+                    return plaintext
+                
+                else:
+                    RNS.log("Decryption failed because the token size was invalid.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                    return None
             else:
-                RNS.log("Decryption failed because the token size was invalid.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-                return None
-        else:
-            raise KeyError("Decryption failed because identity does not hold a private key")
+                raise KeyError("Decryption failed because identity does not hold a private key")
+        except Exception as e:
+            RNS.log("Decryption by "+RNS.prettyhexrep(self.hash)+" failed: "+str(e), RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+            if ratchet_id_receiver:
+                ratchet_id_receiver.latest_ratchet_id = None
+            return None
 
 
     def sign(self, message):
-        """
-        Signs information by the identity.
-
-        :param message: The message to be signed as *bytes*.
-        :returns: Signature as *bytes*.
-        :raises: *KeyError* if the instance does not hold a private key.
-        """
-        if self.sig_prv != None:
-            try:
-                return self.sig_prv.sign(message)    
-            except Exception as e:
-                RNS.log("The identity "+str(self)+" could not sign the requested message. The contained exception was: "+str(e), RNS.LOG_ERROR)
-                raise e
-        else:
+        try:
+            if self.crypto_mode == Identity.CRYPTO_PQ and self.pq_sig_prv is not None:
+                return self.pq_sig_prv.sign(message)
+            if self.crypto_mode == Identity.CRYPTO_HYBRID and self.sig_prv is not None and self.pq_sig_prv is not None:
+                return self.sig_prv.sign(message) + self.pq_sig_prv.sign(message)
+            if self.crypto_mode == Identity.CRYPTO_LEGACY and self.sig_prv is not None:
+                return self.sig_prv.sign(message)
             raise KeyError("Signing failed because identity does not hold a private key")
+        except Exception as e:
+            RNS.log("The identity "+str(self)+" could not sign the requested message. The contained exception was: "+str(e), RNS.LOG_ERROR)
+            raise
 
     def validate(self, signature, message):
-        """
-        Validates the signature of a signed message.
-
-        :param signature: The signature to be validated as *bytes*.
-        :param message: The message to be validated as *bytes*.
-        :returns: True if the signature is valid, otherwise False.
-        :raises: *KeyError* if the instance does not hold a public key.
-        """
-        if self.pub != None:
-            try:
-                self.sig_pub.verify(signature, message)
-                return True
-            except Exception as e:
+        """Validate a signature according to this identity's exact mode."""
+        if self.crypto_mode == Identity.CRYPTO_PQ:
+            if self.pq_sig_pub is None or len(signature) != Identity.PQ_SIG_SIGNATURE_SIZE:
                 return False
-        else:
+            try:
+                return self.pq_sig_pub.verify(signature, message)
+            except Exception:
+                return False
+        if self.crypto_mode == Identity.CRYPTO_HYBRID:
+            try:
+                parts = Identity.split_signature(self.crypto_mode, signature)
+                if not self.sig_pub or not self.pq_sig_pub:
+                    return False
+                self.sig_pub.verify(parts["classical"], message)
+                return bool(self.pq_sig_pub.verify(parts["pq"], message))
+            except Exception:
+                return False
+        if self.sig_pub is None:
             raise KeyError("Signature validation failed because identity does not hold a public key")
+        try:
+            self.sig_pub.verify(signature, message)
+            return True
+        except Exception:
+            return False
 
     def prove(self, packet, destination=None):
         signature = self.sign(packet.packet_hash)

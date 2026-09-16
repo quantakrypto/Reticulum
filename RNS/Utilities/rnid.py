@@ -199,6 +199,20 @@ def ensure_reticulum(args):
 # Identity Loading & Resolution #
 #################################
 
+def _valid_identity_bytes(data, private=False):
+    if not isinstance(data, bytes):
+        return False
+    if data.startswith(RNS.Identity.KEY_FORMAT_MAGIC):
+        return True
+    expected = RNS.Identity._legacy_private_size() if private else RNS.Identity._legacy_public_size()
+    if len(data) == expected:
+        return True
+    if not private and len(data) in (RNS.Identity._public_key_size(RNS.Identity.CRYPTO_PQ),
+                                     RNS.Identity._public_key_size(RNS.Identity.CRYPTO_HYBRID)):
+        return True
+    return False
+
+
 def get_operating_identity(args, allow_none=False, no_cache=False):
     global reticulum
     identity = None
@@ -276,86 +290,68 @@ def get_operating_identity(args, allow_none=False, no_cache=False):
             except Exception as e: print(f"Invalid hexadecimal hash provided: {e}"); exit(R_INVALID_IDENTITY)
 
     elif args.import_pub or args.import_prv:
-        prvsize = RNS.Identity.KEYSIZE//8
-        pubsize = prvsize
+        prvsize = RNS.Identity._private_key_size()
+        pubsize = RNS.Identity._public_key_size()
         identity_bytes = None
         if args.import_pub:
             try:
                 identity_bytes = None
                 import_path = os.path.expanduser(args.import_pub)
                 if os.path.isfile(import_path):
-                    try:
-                        with open(import_path, "rb") as fh: file_input = fh.read()
-                        if file_input and len(file_input) == pubsize:
-                            identity_bytes = file_input
-                            print(f"Reticulum Identity imported from {import_path}")
-                    except: pass
-
+                    with open(import_path, "rb") as fh:
+                        candidate = fh.read()
+                    if _valid_identity_bytes(candidate, private=False):
+                        identity_bytes = candidate
+                        print(f"Reticulum Identity imported from {import_path}")
                 if not identity_bytes:
-                    if len(args.import_pub) == pubsize*2:
+                    for decoder in (
+                        lambda value: bytes.fromhex(value),
+                        lambda value: base64.b32decode(value),
+                        lambda value: base64.urlsafe_b64decode(value),
+                    ):
                         try:
-                            identity_bytes = bytes.fromhex(args.import_pub)
-                            print("Reticulum Identity imported from hex input")
-                        except: pass
-
+                            candidate = decoder(args.import_pub)
+                            if _valid_identity_bytes(candidate, private=False):
+                                identity_bytes = candidate
+                                break
+                        except Exception:
+                            pass
                 if not identity_bytes:
-                    try:
-                        b32_decoded = base64.b32decode(args.import_pub)
-                        if len(b32_decoded) == pubsize:
-                            identity_bytes = b32_decoded
-                            print("Reticulum Identity imported from base32 input")
-                    except: pass
-
-                if not identity_bytes:
-                    try:
-                        b64_decoded = base64.urlsafe_b64decode(args.import_pub)
-                        if len(b64_decoded) == pubsize:
-                            identity_bytes = b64_decoded
-                            print("Reticulum Identity imported from base64 input")
-                    except: pass
-
-                if not identity_bytes: print("Could not decode specified data to a valid public Reticulum Identity"); exit(R_INVALID_IDENTITY)
-
-            except Exception as e: print("Invalid identity data specified for private identity import: "+str(e)); exit(R_INVALID_IDENTITY)
+                    print("Could not decode specified data to a valid public Reticulum Identity")
+                    exit(R_INVALID_IDENTITY)
+            except Exception as e:
+                print("Invalid identity data specified for public identity import: "+str(e))
+                exit(R_INVALID_IDENTITY)
 
         elif args.import_prv:
             try:
                 identity_bytes = None
                 import_path = os.path.expanduser(args.import_prv)
                 if os.path.isfile(import_path):
-                    try:
-                        with open(import_path, "rb") as fh: file_input = fh.read()
-                        if file_input and len(file_input) == prvsize:
-                            identity_bytes = file_input
-                            print(f"Reticulum Identity imported from {import_path}")
-                    except: pass
-
+                    with open(import_path, "rb") as fh:
+                        candidate = fh.read()
+                    if _valid_identity_bytes(candidate, private=True):
+                        identity_bytes = candidate
+                        print(f"Reticulum Identity imported from {import_path}")
                 if not identity_bytes:
-                    if len(args.import_prv) == prvsize*2:
+                    for decoder in (
+                        lambda value: bytes.fromhex(value),
+                        lambda value: base64.b32decode(value),
+                        lambda value: base64.urlsafe_b64decode(value),
+                    ):
                         try:
-                            identity_bytes = bytes.fromhex(args.import_prv)
-                            print("Reticulum Identity imported from hex input")
-                        except: pass
-
+                            candidate = decoder(args.import_prv)
+                            if _valid_identity_bytes(candidate, private=True):
+                                identity_bytes = candidate
+                                break
+                        except Exception:
+                            pass
                 if not identity_bytes:
-                    try:
-                        b32_decoded = base64.b32decode(args.import_prv)
-                        if len(b32_decoded) == prvsize:
-                            identity_bytes = b32_decoded
-                            print("Reticulum Identity imported from base32 input")
-                    except: pass
-
-                if not identity_bytes:
-                    try:
-                        b64_decoded = base64.urlsafe_b64decode(args.import_prv)
-                        if len(b64_decoded) == prvsize:
-                            identity_bytes = b64_decoded
-                            print("Reticulum Identity imported from base64 input")
-                    except: pass
-
-                if not identity_bytes: print("Could not decode specified data to a valid private Reticulum Identity"); exit(R_INVALID_IDENTITY)
-
-            except Exception as e: print("Invalid identity data specified for private identity import: "+str(e)); exit(R_INVALID_IDENTITY)
+                    print("Could not decode specified data to a valid private Reticulum Identity")
+                    exit(R_INVALID_IDENTITY)
+            except Exception as e:
+                print("Invalid identity data specified for private identity import: "+str(e))
+                exit(R_INVALID_IDENTITY)
 
         if args.import_prv:
             try: identity = RNS.Identity.from_bytes(identity_bytes)
@@ -410,13 +406,42 @@ def get_rsg_data(rsg):
 
     return rsg_data
 
-def extract_signed_rsg_data(rsg):
-    siglen   = RNS.Identity.SIGLENGTH//8
-    rsg_data = get_rsg_data(rsg)
-    envelope = rsg_data[siglen:]
+def _parse_rsg_signature(rsg_data):
+    """Parse an RSG by discovering the signer's public-key mode first."""
+    if not isinstance(rsg_data, bytes):
+        return None
+    candidate_offsets = {
+        RNS.Identity._legacy_signature_size(),
+        RNS.Identity.PQ_SIG_SIGNATURE_SIZE,
+        RNS.Identity._legacy_signature_size() + RNS.Identity.PQ_SIG_SIGNATURE_SIZE,
+    }
+    for offset in sorted(candidate_offsets):
+        if len(rsg_data) <= offset:
+            continue
+        try:
+            signed_data = mp.unpackb(rsg_data[offset:])
+            metadata = signed_data.get("meta", {})
+            public_key = metadata.get("pubkey")
+            if (not isinstance(signed_data, dict) or
+                    signed_data.get("hashtype") not in RSG_HASHTYPES or
+                    not isinstance(metadata, dict) or
+                    not isinstance(public_key, bytes)):
+                continue
+            signer = RNS.Identity(create_keys=False)
+            if not signer.load_public_key(public_key):
+                continue
+            if offset != RNS.Identity._signature_size(signer.crypto_mode):
+                continue
+            return rsg_data[:offset], signed_data, signer
+        except Exception:
+            continue
+    return None
 
-    try: return mp.unpackb(envelope)
-    except: return None
+
+def extract_signed_rsg_data(rsg):
+    rsg_data = get_rsg_data(rsg)
+    parsed = _parse_rsg_signature(rsg_data)
+    return parsed[1] if parsed is not None else None
 
 def get_rsg_hash(message):
     sha = None
@@ -431,59 +456,43 @@ def get_rsg_hash(message):
 def rsg_is_legacy_format(rsg):
     rsg_data = get_rsg_data(rsg)
     if not rsg_data: return False
-    return True if len(rsg_data) == RNS.Identity.SIGLENGTH//8 else False
+    return True if len(rsg_data) == RNS.Identity._legacy_signature_size() else False
 
 def validate_rsg(rsg, message=None, required_signer=None):
-    if not message: raise ValueError(f"No message specified for rsg validation")
-    if not type(required_signer) in [RNS.Identity, bytes, type(None)]: raise TypeError(f"Invalid required signer type {type(required_signer)}")
-    
-    if   type(required_signer) == RNS.Identity: required_signer_hash = required_signer.hash
-    elif type(required_signer) == bytes:        required_signer_hash = required_signer
-    else:                                       required_signer_hash = None
+    if not message:
+        raise ValueError(f"No message specified for rsg validation")
+    if not isinstance(required_signer, (RNS.Identity, bytes, type(None))):
+        raise TypeError(f"Invalid required signer type {type(required_signer)}")
 
-    siglen = RNS.Identity.SIGLENGTH//8
+    if isinstance(required_signer, RNS.Identity):
+        required_signer_hash = required_signer.hash
+    elif isinstance(required_signer, bytes):
+        required_signer_hash = required_signer
+    else:
+        required_signer_hash = None
+
     rsg_data = get_rsg_data(rsg)
     rsg_hash = get_rsg_hash(message)
+    if not rsg_data:
+        return False, None, None
+    if len(rsg_data) == RNS.Identity._legacy_signature_size():
+        raise ValueError("Cannot validate legacy rsg format")
 
-    if len(rsg_data) == siglen: raise ValueError(f"Cannot validate legacy rsg format")
+    parsed = _parse_rsg_signature(rsg_data)
+    if parsed is None:
+        return False, None, None
+    signature, signed_data, signing_identity = parsed
+    try:
+        if required_signer_hash is not None and signing_identity.hash != required_signer_hash:
+            return False, None, None
+        if signed_data["hash"] != rsg_hash:
+            return False, None, None
+        if signing_identity.validate(signature, mp.packb(signed_data)):
+            return True, signed_data, signing_identity
+    except Exception:
+        pass
+    return False, None, None
 
-    if not rsg_data: return False, None, None
-    else:
-        if len(rsg_data) < siglen+1: return False, None, None
-        else:
-            signing_identity = None
-            signature        = rsg_data[:siglen]
-            envelope         = rsg_data[siglen:]
-
-            try: signed_data = mp.unpackb(envelope)
-            except: return False, None, None
-
-            if not "hashtype" in signed_data or not "hash" in signed_data: return False, None, None
-            if not signed_data["hashtype"] in RSG_HASHTYPES:               return False, None, None
-            if not "meta" in signed_data:                                  return False, None, None
-            if not "signer" in signed_data["meta"]:                        return False, None, None
-            if not "pubkey" in signed_data["meta"]:                        return False, None, None
-
-            try:
-                if type(required_signer) == RNS.Identity:
-                    signing_identity = required_signer
-                
-                else:
-                    signing_identity = RNS.Identity(create_keys=False)
-                    signing_identity.load_public_key(signed_data["meta"]["pubkey"])
-
-            except: return False, None, None
-
-            if required_signer_hash == None: required_signer_hash = signing_identity.hash
-
-            if not signing_identity:                                       return False, None, None
-            if not signing_identity.hash == required_signer_hash:          return False, None, signing_identity
-            if signed_data["hash"] != rsg_hash:                            return False, None, signing_identity
-            else:
-                if not signing_identity.validate(signature, envelope):     return False, signed_data, signing_identity
-                else:                                                      return True,  signed_data, signing_identity
-
-            return False, signed_data, signing_identity
 
 def create_rsg(signer_identity, message, embed=False, meta=None, output="bin"):
     if not output in ["bin", "hex", "base32", "base256", "base64"]: raise TypeError(f"Invalid output format for rsg creation")
@@ -974,7 +983,7 @@ def print_identity_information(args, identity):
     elif args.base32: print("Public Key    : "+base64.b32encode(identity.get_public_key()).decode("utf-8"))
     else:             print("Public Key    : "+RNS.hexrep(identity.get_public_key(), delimit=False))
     
-    if identity.prv:
+    if identity.has_private_key():
         if args.print_private:
             if   args.base64: print("Private Key   : "+base64.urlsafe_b64encode(identity.get_private_key()).decode("utf-8"))
             elif args.base32: print("Private Key   : "+base64.b32encode(identity.get_private_key()).decode("utf-8"))

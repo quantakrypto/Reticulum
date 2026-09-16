@@ -1436,14 +1436,11 @@ class ReticulumGitClient():
             signature = doc["meta"].get("signature", None)
             pubkey = doc["meta"].get("identity", None)
             content = doc.get("content", "")
-            if signature and type(signature) == bytes and len(signature) == RNS.Identity.SIGLENGTH//8:
-                if pubkey and type(pubkey) == bytes and len(pubkey) == RNS.Identity.KEYSIZE//8:
-                    signature_str = "Not valid"
-                    identity = RNS.Identity(create_keys=False)
-                    identity.load_public_key(pubkey)
-                    signature_validated = identity.validate(signature, content.encode("utf-8"))
-                    if signature_validated:
-                        signature_str = "Valid"
+            if signature and type(signature) == bytes and pubkey and type(pubkey) == bytes:
+                identity = RNS.Identity(create_keys=False)
+                if identity.load_public_key(pubkey):
+                    signature_str = "Valid" if identity.validate(signature, content.encode("utf-8")) else "Not valid"
+                    if signature_str == "Valid":
                         author_str = RNS.prettyhexrep(identity.hash)
             
             dt = f"{doc['meta']['title']} (#{doc['id']})"
@@ -4000,11 +3997,9 @@ class ReticulumGitNode():
         format_type = data.get("format", "markdown")
         signature   = data.get("signature", None)
         signed_data = content.encode("utf-8")
-        sig_length  = RNS.Identity.SIGLENGTH//8
         limit       = self.WORK_DOC_LIMIT
 
         if not signature:                                              return self.RES_INVALID_REQ.to_bytes(1, "big") + b"No signature provided"
-        if signature and not len(signature) == sig_length:             return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid signature length"
         if not remote_identity.validate(signature, signed_data):       return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid signature"
         if len(title)+len(content)+len(format_type) > limit:           return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Content limit exceeded"
         if not title:                                                  return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Title is required"
@@ -4038,11 +4033,9 @@ class ReticulumGitNode():
         format_type = data.get("format", "markdown")
         signature   = data.get("signature", None)
         signed_data = content.encode("utf-8")
-        sig_length  = RNS.Identity.SIGLENGTH//8
         limit       = self.WORK_DOC_LIMIT
 
         if not signature:                                        return self.RES_INVALID_REQ.to_bytes(1, "big") + b"No signature provided"
-        if signature and not len(signature) == sig_length:       return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid signature length"
         if not remote_identity.validate(signature, signed_data): return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid signature"
         if len(title)+len(content)+len(format_type) > limit:     return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Content limit exceeded"
         if not title:                                            return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Title is required"
@@ -4090,7 +4083,6 @@ class ReticulumGitNode():
         title       = data.get("title", "")
         signature   = data.get("signature", None)
         signed_data = content.encode("utf-8")
-        sig_length  = RNS.Identity.SIGLENGTH//8
         limit       = self.WORK_DOC_LIMIT
         
         size = 0
@@ -4099,7 +4091,6 @@ class ReticulumGitNode():
 
         if not scope in ["active", "completed", "proposed", "all"]:    return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid request"
         if not signature:                                              return self.RES_INVALID_REQ.to_bytes(1, "big") + b"No signature provided"
-        if signature and not len(signature) == sig_length:             return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid signature length"
         if not remote_identity.validate(signature, signed_data):       return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Invalid signature"
         if size > limit:                                               return self.RES_INVALID_REQ.to_bytes(1, "big") + b"Content limit exceeded"
         if not content and not title:                                  return self.RES_INVALID_REQ.to_bytes(1, "big") + b"No changes specified"

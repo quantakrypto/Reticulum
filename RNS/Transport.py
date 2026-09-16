@@ -296,12 +296,178 @@ class Transport:
 
     identity                    = None
     network_identity            = None
-
+    pq_fragment_assembler      = None
+    pq_session_assembler       = None
+    pq_session_manager         = None
     _identity                   = None
     _should_run                 = True
 
     @staticmethod
-    def internal_identity(): return Transport._identity
+    def internal_identity():
+        return Transport._identity
+
+    @staticmethod
+    def _pq_assembler():
+        if Transport.pq_fragment_assembler is None:
+            from RNS.PQ import FragmentAssembler
+            Transport.pq_fragment_assembler = FragmentAssembler()
+        return Transport.pq_fragment_assembler
+    @staticmethod
+    def _pq_session_assembler():
+        if Transport.pq_session_assembler is None:
+            from RNS.PQ import FragmentAssembler
+            Transport.pq_session_assembler = FragmentAssembler(
+                max_records=256, max_bytes=4 * 1024 * 1024)
+        return Transport.pq_session_assembler
+
+    @staticmethod
+    def _handle_pq_session_fragment(packet):
+        from RNS.PQ import (PQFragment, RECORD_SESSION_ACK,
+                            RECORD_SESSION_DATA, RECORD_SESSION_REQUEST)
+        try:
+            fragment = PQFragment.unpack(packet.data)
+        except (TypeError, ValueError):
+            return False
+        if fragment.record_kind not in (
+                RECORD_SESSION_REQUEST, RECORD_SESSION_ACK, RECORD_SESSION_DATA):
+            return False
+        from RNS.PQ import PQSessionManager, fragment_record, RECORD_SESSION_ACK
+        if Transport.pq_session_manager is None:
+            Transport.pq_session_manager = PQSessionManager()
+        manager = Transport.pq_session_manager
+        assembled = Transport._pq_session_assembler().add(fragment)
+        if assembled is None:
+            return True
+
+        destination = None
+        with Transport.destinations_map_lock:
+            candidate = Transport.destinations_map.get(packet.destination_hash)
+            if candidate is not None and candidate.type == packet.destination_type:
+                destination = candidate
+
+        session_destination_hash = packet.destination_hash
+        if fragment.record_kind in (RECORD_SESSION_ACK, RECORD_SESSION_DATA):
+            session_id = assembled[1:9]
+            if destination is None:
+                session_destination_hash, destination = manager.destination_for_session(session_id)
+            if destination is None:
+                return True
+
+        if fragment.record_kind == RECORD_SESSION_REQUEST:
+            if destination is None or destination.identity is None:
+                return True
+            if destination.identity.crypto_mode == RNS.Identity.CRYPTO_LEGACY:
+                return True
+            try:
+                ack, session_id = manager.accept_request(
+                    destination.identity, destination.hash, assembled)
+                packet.pq_session_ack = (session_id, ack)
+                for ack_fragment in fragment_record(RECORD_SESSION_ACK, ack):
+                    response = RNS.Packet(
+                        packet.generate_proof_destination(), ack_fragment.pack(),
+                        packet_type=RNS.Packet.PROOF,
+                        context=RNS.Packet.PQ_FRAGMENT,
+                        attached_interface=packet.receiving_interface)
+                    response.send()
+            except (MemoryError, TypeError, ValueError):
+                return True
+            return True
+
+        if fragment.record_kind == RECORD_SESSION_ACK:
+            try:
+                if manager.validate_ack(session_destination_hash, session_id, assembled):
+                    for data_fragment in manager.data_fragments_after_ack(
+                            session_destination_hash, session_id):
+                        control = RNS.Packet.from_fragment(
+                            destination, data_fragment.pack(),
+                            packet_type=RNS.Packet.DATA,
+                            context=RNS.Packet.PQ_FRAGMENT)
+                        control.send()
+            except (TypeError, ValueError, KeyError):
+                pass
+            return True
+
+        plaintext = manager.decrypt_data(session_destination_hash, assembled)
+        if plaintext is None or destination is None:
+            return True
+        packet.context = RNS.Packet.NONE
+        packet.data = plaintext
+        if destination.callbacks.packet is not None:
+            try:
+                destination.callbacks.packet(plaintext, packet)
+            except Exception as e:
+                RNS.log("Error while executing PQ session receive callback: "+str(e),
+                        RNS.LOG_ERROR)
+        return True
+
+    @staticmethod
+    def _reassemble_announce(packet):
+        from RNS.PQ import PQFragment, RECORD_ANNOUNCE
+        fragment = PQFragment.unpack(packet.data)
+        if fragment.record_kind != RECORD_ANNOUNCE:
+            return packet
+        assembler = Transport._pq_assembler()
+        assembled = assembler.add(fragment)
+        if assembled is None:
+            return None
+        fragment_set = assembler.take_completed(RECORD_ANNOUNCE, fragment.record_id)
+        logical = RNS.Packet(None, packet.raw)
+        logical.packet_type = RNS.Packet.ANNOUNCE
+        logical.destination_hash = packet.destination_hash
+        logical.destination_type = packet.destination_type
+        logical.header_type = packet.header_type
+        logical.transport_id = packet.transport_id
+        logical.context = (fragment.flags >> 1) & 0x0F
+        logical.context_flag = fragment.flags & 0x01
+        mode_flags = (fragment.flags >> 5) & 0x07
+        logical.announce_mode = {
+            1: RNS.Identity.CRYPTO_PQ,
+            2: RNS.Identity.CRYPTO_HYBRID,
+        }.get(mode_flags)
+        logical.data = assembled
+        logical.packet_hash = fragment.record_id
+        logical.fragment_set = fragment_set
+        logical.hops = packet.hops
+        logical.receiving_interface = packet.receiving_interface
+        logical.rssi = packet.rssi
+        logical.snr = packet.snr
+        logical.q = packet.q
+        return logical
+    @staticmethod
+    def _announce_retransmit_packets(packet, destination, context, attached_interface,
+                                     hop_count, block_rebroadcasts=False):
+        if packet.fragment_set:
+            from RNS.PQ import PQFragment
+            packets = []
+            for fragment in packet.fragment_set:
+                flags = ((fragment.flags & ~0x1E) |
+                         ((context & 0x0F) << 1) |
+                         (packet.context_flag & 0x01))
+                fragment = PQFragment(fragment.record_kind, fragment.record_id,
+                                      fragment.fragment_index, fragment.fragment_count,
+                                      fragment.total_length, fragment.payload, flags)
+                item = RNS.Packet.from_fragment(
+                    destination, fragment.pack(), packet_type=RNS.Packet.ANNOUNCE,
+                    context=RNS.Packet.PQ_FRAGMENT, header_type=RNS.Packet.HEADER_2,
+                    transport_id=Transport.identity.hash,
+                    attached_interface=attached_interface,
+                    context_flag=packet.context_flag)
+                item.transport_type = Transport.TRANSPORT
+                item.hops = hop_count
+                item.flags = item.get_packed_flags()
+                item.header = (bytes([item.flags, item.hops]) + Transport.identity.hash +
+                               destination.hash + bytes([RNS.Packet.PQ_FRAGMENT]))
+                item.raw = item.header + item.ciphertext
+                packets.append(item)
+            return packets
+        item = RNS.Packet(destination, packet.data, RNS.Packet.ANNOUNCE,
+                          context=context, header_type=RNS.Packet.HEADER_2,
+                          transport_type=Transport.TRANSPORT,
+                          transport_id=Transport.identity.hash,
+                          attached_interface=attached_interface,
+                          context_flag=packet.context_flag)
+        item.hops = hop_count
+        return [item]
 
     @staticmethod
     def start(reticulum_instance):
@@ -795,21 +961,15 @@ class Transport:
                                         announce_destination.hash = packet.destination_hash
                                         announce_destination.hexhash = announce_destination.hash.hex()
                                         
-                                        new_packet = RNS.Packet(announce_destination,
-                                                                announce_data,
-                                                                RNS.Packet.ANNOUNCE,
-                                                                context = announce_context,
-                                                                header_type = RNS.Packet.HEADER_2,
-                                                                transport_type = Transport.TRANSPORT,
-                                                                transport_id = Transport.identity.hash,
-                                                                attached_interface = attached_interface,
-                                                                context_flag = packet.context_flag)
-
-                                        new_packet.hops = announce_entry[4]
-                                        if block_rebroadcasts: RNS.log("Rebroadcasting announce as path response for "+RNS.prettyhexrep(announce_destination.hash)+" with hop count "+str(new_packet.hops), RNS.LOG_PATHING) if RNS.sl(RNS.LOG_PATHING) else None
-                                        else: RNS.log("Rebroadcasting announce for "+RNS.prettyhexrep(announce_destination.hash)+" with hop count "+str(new_packet.hops), RNS.LOG_PATHING) if RNS.sl(RNS.LOG_PATHING) else None
-                                        
-                                        outgoing.append(new_packet)
+                                        new_packets = Transport._announce_retransmit_packets(
+                                            packet, announce_destination, announce_context,
+                                            attached_interface, announce_entry[4], block_rebroadcasts)
+                                        for new_packet in new_packets:
+                                            if block_rebroadcasts:
+                                                RNS.log("Rebroadcasting announce as path response for "+RNS.prettyhexrep(announce_destination.hash)+" with hop count "+str(new_packet.hops), RNS.LOG_PATHING)
+                                            else:
+                                                RNS.log("Rebroadcasting announce for "+RNS.prettyhexrep(announce_destination.hash)+" with hop count "+str(new_packet.hops), RNS.LOG_PATHING)
+                                            outgoing.append(new_packet)
 
                                         # This handles an edge case where a peer sends a path
                                         # request for a destination just after an announce for
@@ -1961,7 +2121,17 @@ class Transport:
             Transport.add_packet_hash(packet.packet_hash)
             # TODO: Enable when caching has been redesigned
             # Transport.cache(packet)
-        
+
+        if packet.context == RNS.Packet.PQ_FRAGMENT and packet.packet_type in (
+                RNS.Packet.DATA, RNS.Packet.PROOF):
+            try:
+                from RNS.PQ import FRAGMENT_MAGIC
+                if packet.data.startswith(FRAGMENT_MAGIC):
+                    if Transport._handle_pq_session_fragment(packet):
+                        return
+            except (TypeError, ValueError, MemoryError):
+                return
+
         # Check special conditions for local clients connected
         # through a shared Reticulum instance
         from_local_client         = (packet.receiving_interface in Transport.local_client_interfaces)
@@ -2762,48 +2932,43 @@ class Transport:
 
     @staticmethod
     def synthesize_tunnel(interface):
+        if RNS.Identity.CRYPTO_MODE != RNS.Identity.CRYPTO_LEGACY:
+            return
         try:
             interface_hash = interface.get_hash()
-            public_key     = RNS.Transport.identity.get_public_key()
-            random_hash    = RNS.Identity.get_random_hash()
-            
-            tunnel_id_data = public_key+interface_hash
-            tunnel_id      = RNS.Identity.full_hash(tunnel_id_data)
-
-            signed_data    = tunnel_id_data+random_hash
-            signature      = Transport.identity.sign(signed_data)
-            
-            data           = signed_data+signature
-
-            tnl_snth_dst   = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.PLAIN, Transport.APP_NAME, "tunnel", "synthesize")
-
-            packet = RNS.Packet(tnl_snth_dst, data, packet_type = RNS.Packet.DATA, transport_type = RNS.Transport.BROADCAST, header_type = RNS.Packet.HEADER_1, attached_interface = interface)
+            public_key = RNS.Transport.identity.get_public_key()
+            random_hash = RNS.Identity.get_random_hash()
+            tunnel_id_data = public_key + interface_hash
+            tunnel_id = RNS.Identity.full_hash(tunnel_id_data)
+            signed_data = tunnel_id_data + random_hash
+            signature = Transport.identity.sign(signed_data)
+            data = signed_data + signature
+            tnl_snth_dst = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.PLAIN,
+                                           Transport.APP_NAME, "tunnel", "synthesize")
+            packet = RNS.Packet(tnl_snth_dst, data, packet_type=RNS.Packet.DATA,
+                                transport_type=RNS.Transport.BROADCAST,
+                                header_type=RNS.Packet.HEADER_1, attached_interface=interface)
             packet.send()
-
             interface.wants_tunnel = False
-
-        except Exception as e: RNS.log(f"Could not synthesize tunnel for {interface}: {e}", RNS.LOG_ERROR)
+        except Exception as e:
+            RNS.log(f"Could not synthesize tunnel for {interface}: {e}", RNS.LOG_ERROR)
 
     @staticmethod
     def tunnel_synthesize_handler(data, packet):
+        if RNS.Identity.CRYPTO_MODE != RNS.Identity.CRYPTO_LEGACY:
+            return
         try:
             expected_length = RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8+RNS.Identity.SIGLENGTH//8
             if len(data) == expected_length:
-                public_key     = data[:RNS.Identity.KEYSIZE//8]
+                public_key = data[:RNS.Identity.KEYSIZE//8]
                 interface_hash = data[RNS.Identity.KEYSIZE//8:RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8]
                 tunnel_id_data = public_key+interface_hash
-                tunnel_id      = RNS.Identity.full_hash(tunnel_id_data)
-                random_hash    = data[RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
-                
-                signature      = data[RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8:expected_length]
-                signed_data    = tunnel_id_data+random_hash
-
+                tunnel_id = RNS.Identity.full_hash(tunnel_id_data)
+                random_hash = data[RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
+                signature = data[RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8:expected_length]
                 remote_transport_identity = RNS.Identity(create_keys=False)
-                remote_transport_identity.load_public_key(public_key)
-
-                if remote_transport_identity.validate(signature, signed_data):
+                if remote_transport_identity.load_public_key(public_key) and remote_transport_identity.validate(signature, tunnel_id_data+random_hash):
                     Transport.handle_tunnel(tunnel_id, packet.receiving_interface)
-
         except Exception as e:
             RNS.log("An error occurred while validating tunnel establishment packet.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
             RNS.log("The contained exception was: "+str(e), RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
@@ -3736,10 +3901,8 @@ class Transport:
 
     @staticmethod
     def announce_emitted(packet):
-        random_blob = packet.data[RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8+10]
-        announce_emitted = Transport.timebase_from_random_blob(random_blob)
-
-        return announce_emitted
+        random_blob = RNS.Identity.parse_announce(packet.data, packet.context_flag)["random_hash"]
+        return Transport.timebase_from_random_blob(random_blob)
 
     @staticmethod
     def save_packet_hashlist(background=False):

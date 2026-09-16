@@ -115,6 +115,10 @@ Returns whether proofs sent are explicit or implicit.
 * **Returns:**
   True if the current running configuration specifies to use implicit proofs. False if not.
 
+#### `static crypto_mode()`
+
+Returns the active crypto profile (`legacy`, `hybrid`, or `pq`).
+
 #### `static transport_enabled()`
 
 Returns whether Transport is enabled for the running

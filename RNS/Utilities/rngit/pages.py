@@ -1648,13 +1648,10 @@ class NomadNetworkNode():
 
         signature_validated = False
         signature_str = "Document not signed"
-        if signature and type(signature) == bytes and len(signature) == RNS.Identity.SIGLENGTH//8:
-            if pubkey and type(pubkey) == bytes and len(pubkey) == RNS.Identity.KEYSIZE//8:
-                signature_str = "Not valid"
-                identity = RNS.Identity(create_keys=False)
-                identity.load_public_key(pubkey)
-                signature_validated = identity.validate(signature, content.encode("utf-8"))
-                if signature_validated: signature_str = "Valid"
+        if signature and type(signature) == bytes and pubkey and type(pubkey) == bytes:
+            identity = RNS.Identity(create_keys=False)
+            if identity.load_public_key(pubkey):
+                signature_str = "Valid" if identity.validate(signature, content.encode("utf-8")) else "Not valid"
 
         # Document header
         content_parts.append(self.m_heading(f"{doc_title}", 2))

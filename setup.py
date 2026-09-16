@@ -33,7 +33,6 @@ if pure_python:
 else:
     pkg_name = "rns"
     requirements = ['cryptography>=3.4.7', 'pyserial>=3.5']
-
 excluded_modules = ["tests.*", "tests"]
 
 DIRECTIVES      = { "annotation_typing": False }
@@ -193,4 +192,5 @@ setuptools.setup(
     python_requires='>=3.7',
     ext_modules=ext_modules,
     cmdclass=build_cmdclass,
+    extras_require={"pqc": ["liboqs-python>=0.16.0"]},
 )

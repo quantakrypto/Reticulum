@@ -106,14 +106,12 @@ class Link:
     """
 
     WATCHDOG_MAX_SLEEP  = 5
-
     PENDING             = 0x00
     HANDSHAKE           = 0x01
+    PQ_HANDSHAKE        = 0x05
     ACTIVE              = 0x02
     STALE               = 0x03
     CLOSED              = 0x04
-
-    TIMEOUT             = 0x01
     INITIATOR_CLOSED    = 0x02
     DESTINATION_CLOSED  = 0x03
 
@@ -126,20 +124,12 @@ class Link:
     MODE_AES256_CBC     = 0x01
     MODE_AES256_GCM     = 0x02
     MODE_OTP_RESERVED   = 0x03
-    MODE_PQ_RESERVED_1  = 0x04
-    MODE_PQ_RESERVED_2  = 0x05
-    MODE_PQ_RESERVED_3  = 0x06
-    MODE_PQ_RESERVED_4  = 0x07
     ENABLED_MODES       = [MODE_AES256_CBC]
     MODE_DEFAULT        =  MODE_AES256_CBC
     MODE_DESCRIPTIONS   = {MODE_AES128_CBC: "AES_128_CBC",
                            MODE_AES256_CBC: "AES_256_CBC",
                            MODE_AES256_GCM: "MODE_AES256_GCM",
-                           MODE_OTP_RESERVED: "MODE_OTP_RESERVED",
-                           MODE_PQ_RESERVED_1: "MODE_PQ_RESERVED_1",
-                           MODE_PQ_RESERVED_2: "MODE_PQ_RESERVED_2",
-                           MODE_PQ_RESERVED_3: "MODE_PQ_RESERVED_3",
-                           MODE_PQ_RESERVED_4: "MODE_PQ_RESERVED_4"}
+                           MODE_OTP_RESERVED: "MODE_OTP_RESERVED"}
 
     MTU_BYTEMASK        = 0x1FFFFF
     MODE_BYTEMASK       = 0xE0
@@ -158,8 +148,9 @@ class Link:
 
     @staticmethod
     def mtu_from_lp_packet(packet):
-        if len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
-            mtu_bytes = packet.data[RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2:RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE]
+        proof_sig_len = RNS.Identity._signature_size()
+        if len(packet.data) == proof_sig_len+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
+            mtu_bytes = packet.data[proof_sig_len+Link.ECPUBSIZE//2:proof_sig_len+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE]
             return (mtu_bytes[0] << 16) + (mtu_bytes[1] << 8) + (mtu_bytes[2]) & Link.MTU_BYTEMASK
         else: return None
 
@@ -177,8 +168,9 @@ class Link:
 
     @staticmethod
     def mode_from_lp_packet(packet):
-        if len(packet.data) > RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2:
-            mode = packet.data[RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2] >> 5
+        proof_sig_len = RNS.Identity._signature_size()
+        if len(packet.data) > proof_sig_len+Link.ECPUBSIZE//2:
+            mode = packet.data[proof_sig_len+Link.ECPUBSIZE//2] >> 5
             return mode
         else: return Link.MODE_DEFAULT
 
@@ -270,27 +262,34 @@ class Link:
         self.__remote_identity = None
         self.__track_phy_stats = False
         self._channel = None
+        self.pq_proof_assembler = None
+        self.pq_link_assembler = None
+        self.pq_transcript = None
+        self.pq_confirmed = False
+        self.pq_pending_key = None
+        self.pq_identify_assembler = None
 
         if self.destination == None:
             self.initiator = False
-            self.prv     = X25519PrivateKey.generate()
+            self.prv = X25519PrivateKey.generate()
             self.sig_prv = self.owner.identity.sig_prv
-
         else:
             self.initiator = True
             self.expected_hops = RNS.Transport.hops_to(self.destination.hash)
             self.establishment_timeout  = RNS.Reticulum.get_instance().get_first_hop_timeout(destination.hash)
             self.establishment_timeout += Link.ESTABLISHMENT_TIMEOUT_PER_HOP * max(1, RNS.Transport.hops_to(destination.hash))
-            self.prv     = X25519PrivateKey.generate()
+            self.prv = X25519PrivateKey.generate()
             self.sig_prv = Ed25519PrivateKey.generate()
 
         self.token  = None
-        
         self.pub = self.prv.public_key()
         self.pub_bytes = self.pub.public_bytes()
-
-        self.sig_pub = self.sig_prv.public_key()
-        self.sig_pub_bytes = self.sig_pub.public_bytes()
+        if self.sig_prv is None:
+            self.sig_pub = None
+            self.sig_pub_bytes = b""
+        else:
+            self.sig_pub = self.sig_prv.public_key()
+            self.sig_pub_bytes = self.sig_pub.public_bytes()
 
         if peer_pub_bytes == None:
             self.peer_pub = None
@@ -359,58 +358,234 @@ class Link:
                 derive_from=self.shared_key,
                 salt=self.get_salt(),
                 context=self.get_context())
-
+            if self.destination is not None and self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+                self.status = Link.PQ_HANDSHAKE
         else: RNS.log("Handshake attempt on "+str(self)+" with invalid state "+str(self.status), RNS.LOG_ERROR)
+    def _pq_derive_key(self, pq_shared, transcript):
+        import hashlib
+        mode = self.destination.identity.crypto_mode if self.destination is not None else self.owner.identity.crypto_mode
+        length = 64 if self.mode == Link.MODE_AES256_CBC else 32
+        return RNS.Cryptography.hkdf(
+            length=length,
+            derive_from=self.shared_key + pq_shared,
+            salt=self.link_id,
+            context=b"RNS-PQ-LINK"+bytes([mode == RNS.Identity.CRYPTO_HYBRID])+hashlib.sha256(transcript).digest())
+
+    def _activate_pq(self, final_key, transcript):
+        import time
+        self.derived_key = final_key
+        self.pq_transcript = transcript
+        self.pq_confirmed = True
+        self.status = Link.ACTIVE
+        self.activated_at = time.time()
+        self.last_proof = self.activated_at
+        RNS.Transport.activate_link(self)
+        if self.callbacks.link_established is not None:
+            thread = threading.Thread(target=self.callbacks.link_established, args=(self,))
+            thread.daemon = True
+            thread.start()
+
+    def _start_pq_handshake(self):
+        import hashlib
+        if not self.initiator or self.destination is None or self.pq_confirmed:
+            return False
+        from RNS.PQ import RECORD_LINK, fragment_record
+        ciphertext, pq_shared = self.destination.identity.pq_pub.encapsulate()
+        mode = self.destination.identity.crypto_mode
+        transcript = (self.link_id + self.pub_bytes + self.peer_pub_bytes +
+                      ciphertext + bytes([mode == RNS.Identity.CRYPTO_HYBRID]))
+        transcript_hash = hashlib.sha256(transcript).digest()
+        self.pq_transcript = transcript_hash
+        self.pq_pending_key = self._pq_derive_key(pq_shared, transcript_hash)
+        payload = umsgpack.packb({"type": "pq_request", "link_id": self.link_id,
+                                  "mode": mode, "kem": ciphertext,
+                                  "transcript": transcript_hash})
+        for fragment in fragment_record(RECORD_LINK, payload):
+            packet = RNS.Packet(self, fragment.pack(), RNS.Packet.DATA,
+                                context=RNS.Packet.PQ_FRAGMENT)
+            packet.send()
+        return True
+
+    def _handle_pq_handshake_request(self, payload):
+        import hashlib
+        import hmac
+        from RNS.PQ import RECORD_LINK, fragment_record
+        if self.destination is None or self.owner.identity.pq_prv is None:
+            return False
+        request = umsgpack.unpackb(payload)
+        if not isinstance(request, dict) or request.get("type") != "pq_request":
+            return False
+        if request.get("link_id") != self.link_id or request.get("mode") != self.owner.identity.crypto_mode:
+            return False
+        kem = request.get("kem")
+        transcript = request.get("transcript")
+        if not isinstance(kem, bytes) or not isinstance(transcript, bytes):
+            return False
+        expected = hashlib.sha256(self.link_id + self.peer_pub_bytes + self.pub_bytes +
+                                  kem + bytes([self.owner.identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID])).digest()
+        if not hmac.compare_digest(expected, transcript):
+            return False
+        pq_shared = self.owner.identity.pq_prv.decapsulate(kem)
+        final_key = self._pq_derive_key(pq_shared, transcript)
+        confirmation = umsgpack.packb({
+            "type": "pq_confirm", "link_id": self.link_id,
+            "transcript": transcript,
+            "mac": hmac.new(final_key, b"CONFIRM"+transcript, hashlib.sha256).digest(),
+        })
+        for fragment in fragment_record(RECORD_LINK, confirmation):
+            packet = RNS.Packet(self, fragment.pack(), RNS.Packet.PROOF,
+                                context=RNS.Packet.PQ_FRAGMENT)
+            packet.send()
+        self._pq_activate(final_key, transcript)
+        return True
+
 
 
     def prove(self):
         signalling_bytes = Link.signalling_bytes(self.mtu, self.mode)
-        signed_data = self.link_id+self.pub_bytes+self.sig_pub_bytes+signalling_bytes
+        mode = self.owner.identity.crypto_mode
+        if mode == RNS.Identity.CRYPTO_PQ:
+            sig_public = self.owner.identity.pq_sig_pub_bytes
+        elif mode == RNS.Identity.CRYPTO_HYBRID:
+            sig_public = self.owner.identity.sig_pub_bytes + self.owner.identity.pq_sig_pub_bytes
+        else:
+            sig_public = self.sig_pub_bytes
+        signed_data = self.link_id + self.pub_bytes + sig_public + signalling_bytes
         signature = self.owner.identity.sign(signed_data)
-
-        proof_data = signature+self.pub_bytes+signalling_bytes
-        proof = RNS.Packet(self, proof_data, packet_type=RNS.Packet.PROOF, context=RNS.Packet.LRPROOF)
-        proof.send()
-        self.establishment_cost += len(proof.raw)
+        if mode == RNS.Identity.CRYPTO_LEGACY:
+            proof_data = signature+self.pub_bytes+signalling_bytes
+            proof = RNS.Packet(self, proof_data, packet_type=RNS.Packet.PROOF, context=RNS.Packet.LRPROOF)
+            proof.send()
+        else:
+            from RNS.PQ import RECORD_LINK, fragment_record
+            payload = umsgpack.packb({"link_id": self.link_id, "pub": self.pub_bytes,
+                                      "sig_pub": sig_public,
+                                      "signalling": signalling_bytes, "signature": signature})
+            for fragment in fragment_record(RECORD_LINK, payload):
+                proof = RNS.Packet.from_fragment(self, fragment.pack(), packet_type=RNS.Packet.PROOF,
+                                                 context=RNS.Packet.PQ_FRAGMENT)
+                proof.send()
+        self.establishment_cost += len(signature)+len(self.pub_bytes)
         self.had_outbound()
 
-
     def prove_packet(self, packet):
-        signature = self.sign(packet.packet_hash)
-        # TODO: Hardcoded as explicit proof for now
-        # if RNS.Reticulum.should_use_implicit_proof():
-        #   proof_data = signature
-        # else:
-        #   proof_data = packet.packet_hash + signature
-        proof_data = packet.packet_hash + signature
-
+        import hmac
+        pq_link = ((self.__remote_identity is not None and
+                    self.__remote_identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY) or
+                   (self.destination is not None and self.destination.identity is not None and
+                    self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY))
+        if pq_link:
+            proof_data = packet.packet_hash + hmac.new(self.derived_key, packet.packet_hash, "sha256").digest()
+        else:
+            proof_data = packet.packet_hash + self.sign(packet.packet_hash)
         proof = RNS.Packet(self, proof_data, RNS.Packet.PROOF)
         proof.send()
         self.had_outbound()
 
+    def validate_pq_proof(self, packet):
+        from RNS.PQ import FragmentAssembler, PQFragment, RECORD_LINK
+        try:
+            if self.pq_proof_assembler is None:
+                self.pq_proof_assembler = FragmentAssembler(max_records=4, max_bytes=64 * 1024)
+            fragment = PQFragment.unpack(packet.data)
+            if fragment.record_kind != RECORD_LINK:
+                return False
+            payload = self.pq_proof_assembler.add(fragment)
+            if payload is None:
+                return False
+            proof = umsgpack.unpackb(payload)
+            if not isinstance(proof, dict) or proof.get("link_id") != self.link_id:
+                return False
+            if proof.get("type") == "pq_confirm":
+                import hashlib
+                import hmac
+                transcript = proof.get("transcript")
+                mac = proof.get("mac")
+                if self.pq_pending_key is None or transcript != self.pq_transcript:
+                    return False
+                expected = hmac.new(self.pq_pending_key, b"CONFIRM"+transcript,
+                                     hashlib.sha256).digest()
+                if not isinstance(mac, bytes) or not hmac.compare_digest(mac, expected):
+                    return False
+                self._pq_activate(self.pq_pending_key, transcript)
+                return True
+            identity = self.destination.identity
+            if identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
+                sig_public = identity.pq_sig_pub_bytes
+            elif identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID:
+                sig_public = identity.sig_pub_bytes + identity.pq_sig_pub_bytes
+            else:
+                return False
+            if proof.get("sig_pub") != sig_public:
+                return False
+            peer_pub_bytes = proof["pub"]
+            signalling_bytes = proof["signalling"]
+            signed_data = self.link_id + peer_pub_bytes + sig_public + signalling_bytes
+            if not identity.validate(proof["signature"], signed_data):
+                return False
+            self.peer_pub_bytes = peer_pub_bytes
+            self.peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
+            if not hasattr(self.peer_pub, "curve"):
+                self.peer_pub.curve = Link.CURVE
+            self.handshake()
+            if self.status not in (Link.HANDSHAKE, Link.PQ_HANDSHAKE):
+                return False
+            self.rtt = time.time() - self.request_time
+            self.attached_interface = packet.receiving_interface
+            self.__remote_identity = identity
+            self.mtu = RNS.Reticulum.MTU
+            self.update_mdu()
+            if identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+                return self._start_pq_handshake()
+            self.status = Link.ACTIVE
+            self.activated_at = time.time()
+            self.last_proof = self.activated_at
+            RNS.Transport.activate_link(self)
+            if self.callbacks.link_established != None:
+                thread = threading.Thread(target=self.callbacks.link_established, args=(self,))
+                thread.daemon = True
+                thread.start()
+            return True
+        except Exception as e:
+            RNS.log("Error validating PQ link proof: " + str(e), RNS.LOG_DEBUG)
+            return False
+
     def validate_proof(self, packet):
+        if packet.context == RNS.Packet.PQ_FRAGMENT:
+            return self.validate_pq_proof(packet)
         try:
             if self.status == Link.PENDING:
                 signalling_bytes = b""
                 confirmed_mtu = None
                 mode = Link.mode_from_lp_packet(packet)
+                proof_sig_lens = [RNS.Identity._signature_size(self.destination.identity.crypto_mode)]
+                if self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID:
+                    proof_sig_lens = [RNS.Identity._legacy_signature_size(), RNS.Identity.PQ_SIG_SIGNATURE_SIZE, RNS.Identity._legacy_signature_size()+RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
+                elif self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
+                    proof_sig_lens = [RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
+                else:
+                    proof_sig_lens = [RNS.Identity._legacy_signature_size()]
                 RNS.log(f"Validating link request proof with mode {Link.MODE_DESCRIPTIONS[mode]}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                 if mode != self.mode: raise TypeError(f"Invalid link mode {mode} in link request proof")
-                if len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
-                    confirmed_mtu = Link.mtu_from_lp_packet(packet)
-                    signalling_bytes = Link.signalling_bytes(confirmed_mtu, mode)
-                    packet.data = packet.data[:RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2]
-                    RNS.log(f"Destination confirmed link MTU of {RNS.prettysize(confirmed_mtu)}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                matched_sig_len = None
+                for proof_sig_len in proof_sig_lens:
+                    if len(packet.data) == proof_sig_len+Link.ECPUBSIZE//2+Link.LINK_MTU_SIZE:
+                        matched_sig_len = proof_sig_len
+                        confirmed_mtu = Link.mtu_from_lp_packet(packet)
+                        signalling_bytes = Link.signalling_bytes(confirmed_mtu, mode)
+                        packet.data = packet.data[:proof_sig_len+Link.ECPUBSIZE//2]
+                        RNS.log(f"Destination confirmed link MTU of {RNS.prettysize(confirmed_mtu)}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+                        break
 
-                if self.initiator and len(packet.data) == RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2:
-                    peer_pub_bytes = packet.data[RNS.Identity.SIGLENGTH//8:RNS.Identity.SIGLENGTH//8+Link.ECPUBSIZE//2]
+                if self.initiator and matched_sig_len != None and len(packet.data) == matched_sig_len+Link.ECPUBSIZE//2:
+                    peer_pub_bytes = packet.data[matched_sig_len:matched_sig_len+Link.ECPUBSIZE//2]
                     peer_sig_pub_bytes = self.destination.identity.get_public_key()[Link.ECPUBSIZE//2:Link.ECPUBSIZE]
                     self.load_peer(peer_pub_bytes, peer_sig_pub_bytes)
                     self.handshake()
 
                     self.establishment_cost += len(packet.raw)
                     signed_data = self.link_id+self.peer_pub_bytes+self.peer_sig_pub_bytes+signalling_bytes
-                    signature = packet.data[:RNS.Identity.SIGLENGTH//8]
+                    signature = packet.data[:matched_sig_len]
                     
                     if self.destination.identity.validate(signature, signed_data):
                         if self.status != Link.HANDSHAKE:
@@ -464,9 +639,18 @@ class Link:
             signed_data = self.link_id + identity.get_public_key()
             signature = identity.sign(signed_data)
             proof_data = identity.get_public_key() + signature
-
-            proof = RNS.Packet(self, proof_data, RNS.Packet.DATA, context = RNS.Packet.LINKIDENTIFY)
-            proof.send()
+            if identity.crypto_mode == RNS.Identity.CRYPTO_LEGACY or (
+                    len(proof_data) + RNS.Identity.TOKEN_OVERHEAD <= self.mdu):
+                proof = RNS.Packet(self, proof_data, RNS.Packet.DATA, context=RNS.Packet.LINKIDENTIFY)
+                proof.send()
+            else:
+                from RNS.PQ import RECORD_PROOF, fragment_record
+                fragments = fragment_record(RECORD_PROOF, proof_data,
+                                             mtu=self.mtu-RNS.Identity.TOKEN_OVERHEAD)
+                for fragment in fragments:
+                    proof = RNS.Packet(self, fragment.pack(), RNS.Packet.DATA,
+                                       context=RNS.Packet.LINKIDENTIFY)
+                    proof.send()
             self.had_outbound()
 
 
@@ -947,7 +1131,21 @@ class Link:
 
                 if packet.packet_type == RNS.Packet.DATA:
                     should_query = False
-                    if packet.context == RNS.Packet.NONE:
+                    if packet.context == RNS.Packet.PQ_FRAGMENT:
+                        try:
+                            from RNS.PQ import PQFragment, RECORD_LINK
+                            plaintext = self.decrypt(packet.data)
+                            fragment = PQFragment.unpack(plaintext)
+                            if fragment.record_kind == RECORD_LINK:
+                                if self.pq_link_assembler is None:
+                                    from RNS.PQ import FragmentAssembler
+                                    self.pq_link_assembler = FragmentAssembler(max_records=4, max_bytes=64*1024)
+                                payload = self.pq_link_assembler.add(fragment)
+                                if payload is not None and not self.initiator:
+                                    self._handle_pq_handshake_request(payload)
+                        except Exception as e:
+                            RNS.log("Error while handling PQ link handshake fragment: "+str(e), RNS.LOG_DEBUG)
+                    elif packet.context == RNS.Packet.NONE:
                         plaintext = self.decrypt(packet.data)
                         packet.ratchet_id = self.link_id
                         if plaintext != None:
@@ -970,26 +1168,41 @@ class Link:
                     elif packet.context == RNS.Packet.LINKIDENTIFY:
                         plaintext = self.decrypt(packet.data)
                         if plaintext != None:
-                            if not self.initiator and len(plaintext) == RNS.Identity.KEYSIZE//8 + RNS.Identity.SIGLENGTH//8:
-                                public_key   = plaintext[:RNS.Identity.KEYSIZE//8]
-                                signed_data  = self.link_id+public_key
-                                signature    = plaintext[RNS.Identity.KEYSIZE//8:RNS.Identity.KEYSIZE//8+RNS.Identity.SIGLENGTH//8]
-                                identity     = RNS.Identity(create_keys=False)
-                                identity.load_public_key(public_key)
-
-                                if identity.validate(signature, signed_data):
-                                    if RNS.Reticulum.get_instance().is_blackholed(identity.hash):
-                                        RNS.log(f"Terminating incoming link from blackholed identity {RNS.prettyhexrep(identity.hash)}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-                                        self.teardown()
-
+                            try:
+                                from RNS.PQ import FRAGMENT_MAGIC, FragmentAssembler, PQFragment, RECORD_PROOF
+                                if plaintext.startswith(FRAGMENT_MAGIC):
+                                    if self.pq_identify_assembler is None:
+                                        self.pq_identify_assembler = FragmentAssembler(max_records=4, max_bytes=64*1024)
+                                    fragment = PQFragment.unpack(plaintext)
+                                    if fragment.record_kind != RECORD_PROOF:
+                                        plaintext = None
                                     else:
-                                        if self.__remote_identity == None:
-                                            self.__remote_identity = identity
-                                            if self.callbacks.remote_identified != None:
-                                                try: self.callbacks.remote_identified(self, self.__remote_identity)
-                                                except Exception as e: RNS.log(f"Error while executing remote identified callback from {self}. The contained exception was: "+str(e), RNS.LOG_ERROR)
-                                
-                                    self.__update_phy_stats(packet, query_shared=True)
+                                        plaintext = self.pq_identify_assembler.add(fragment)
+                            except Exception:
+                                plaintext = None
+                        if plaintext != None:
+                            identity = None
+                            for mode in (RNS.Identity.CRYPTO_HYBRID, RNS.Identity.CRYPTO_PQ, RNS.Identity.CRYPTO_LEGACY):
+                                public_size = RNS.Identity._public_key_size(mode)
+                                signature_size = RNS.Identity._signature_size(mode)
+                                if len(plaintext) != public_size + signature_size:
+                                    continue
+                                candidate = RNS.Identity(create_keys=False)
+                                public_key = plaintext[:public_size]
+                                signature = plaintext[public_size:]
+                                if candidate.load_public_key(public_key) and candidate.validate(signature, self.link_id+public_key):
+                                    identity = candidate
+                                    break
+                            if not self.initiator and identity is not None:
+                                if RNS.Reticulum.get_instance().is_blackholed(identity.hash):
+                                    RNS.log(f"Terminating incoming link from blackholed identity {RNS.prettyhexrep(identity.hash)}", RNS.LOG_DEBUG)
+                                    self.teardown()
+                                elif self.__remote_identity == None:
+                                    self.__remote_identity = identity
+                                    if self.callbacks.remote_identified != None:
+                                        try: self.callbacks.remote_identified(self, self.__remote_identity)
+                                        except Exception as e: RNS.log(f"Error while executing remote identified callback from {self}. The contained exception was: "+str(e), RNS.LOG_ERROR)
+                                self.__update_phy_stats(packet, query_shared=True)
 
                     elif packet.context == RNS.Packet.REQUEST:
                         try:

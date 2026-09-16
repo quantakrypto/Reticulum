@@ -256,6 +256,7 @@ class Reticulum:
         Reticulum.__static_transport_identity         = False
         Reticulum.__local_hops_delta                  = False
         Reticulum.__link_mtu_discovery                = Reticulum.LINK_MTU_DISCOVERY
+        Reticulum.__crypto_mode                       = RNS.Identity.CRYPTO_DEFAULT
         Reticulum.__remote_management_enabled         = False
         Reticulum.__use_implicit_proof                = True
         Reticulum.__allow_probes                      = False
@@ -343,6 +344,7 @@ class Reticulum:
             time.sleep(1.5)
 
         self.__apply_config()
+        RNS.Identity.set_crypto_mode(Reticulum.__crypto_mode)
         RNS.log(f"Utilising cryptography backend \"{RNS.Cryptography.Provider.backend()}\"", RNS.LOG_DEBUG)
         RNS.log(f"Configuration loaded from {self.configpath}", RNS.LOG_VERBOSE)
 
@@ -575,6 +577,18 @@ class Reticulum:
                     v = self.config["reticulum"].as_bool(option)
                     if v == True:  Reticulum.__use_implicit_proof = True
                     if v == False: Reticulum.__use_implicit_proof = False
+                
+                if option == "crypto_mode":
+                    v = str(self.config["reticulum"][option]).lower().replace("-", "_")
+                    if v in ["legacy", "classical"]:
+                        Reticulum.__crypto_mode = RNS.Identity.CRYPTO_LEGACY
+                    elif v in ["hybrid", "mixed"]:
+                        Reticulum.__crypto_mode = RNS.Identity.CRYPTO_HYBRID
+                    elif v in ["pq", "pq_only", "post_quantum", "post_quantum_only"]:
+                        Reticulum.__crypto_mode = RNS.Identity.CRYPTO_PQ
+                    else:
+                        raise ValueError(f"Unknown crypto_mode '{v}' in configuration")
+                    RNS.Identity.set_crypto_mode(Reticulum.__crypto_mode)
                 
                 if option == "default_gravity":
                     v = self.config["reticulum"].as_int(option)
@@ -1931,6 +1945,10 @@ class Reticulum:
         return Reticulum.__use_implicit_proof
 
     @staticmethod
+    def crypto_mode():
+        return Reticulum.__crypto_mode
+
+    @staticmethod
     def transport_enabled():
         """
         Returns whether Transport is enabled for the running
@@ -2093,6 +2111,11 @@ __default_rns_config__ = '''# This is the default Reticulum config file.
 # for brevity.
 
 enable_transport = False
+
+# Configure post-quantum crypto mode. Explicit PQ modes require the
+# optional liboqs-python capability and never silently downgrade.
+# Valid values: legacy, hybrid, pq
+crypto_mode = legacy
 
 
 # By default, the first program to launch the Reticulum

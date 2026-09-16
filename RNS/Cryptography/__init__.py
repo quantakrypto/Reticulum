@@ -37,6 +37,8 @@ from .HKDF import hkdf
 from .PKCS7 import PKCS7
 from .Token import Token
 from .Provider import backend
+from .PQ import available as pq_available
+from .PQ import MLKEMPrivateKey, MLKEMPublicKey, MLDSAPrivateKey, MLDSAPublicKey
 
 import RNS.Cryptography.Provider as cp
 

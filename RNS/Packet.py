@@ -84,6 +84,7 @@ class Packet:
     COMMAND        = 0x0C   # Packet is a command
     COMMAND_STATUS = 0x0D   # Packet is a status of an executed command
     CHANNEL        = 0x0E   # Packet contains link channel data
+    PQ_FRAGMENT    = 0x10   # Versioned PQ logical-record fragment
     KEEPALIVE      = 0xFA   # Packet is a keepalive packet
     LINKIDENTIFY   = 0xFB   # Packet is a link peer identification proof
     LINKCLOSE      = 0xFC   # Packet is a link close message
@@ -118,7 +119,7 @@ class Packet:
     __slots__ += "transport_id", "data", "flags", "raw", "packed", "sent", "create_receipt", "receipt", "fromPacked", "MTU"
     __slots__ += "sent_at", "packet_hash", "ratchet_id", "attached_interface", "receiving_interface", "rssi", "snr", "q"
     __slots__ += "ciphertext", "plaintext", "destination_hash", "destination_type", "link", "map_hash", "is_outbound_pr"
-    __slots__ += "traffic_class", "announce_signature_validated"
+    __slots__ += "traffic_class", "announce_signature_validated", "announce_mode", "fragment_set", "pq_session_ack"
 
     def __init__(self, destination, data, packet_type = DATA, context = NONE, transport_type = RNS.Transport.BROADCAST,
                  header_type = HEADER_1, transport_id = None, attached_interface = None, create_receipt = True, context_flag=FLAG_UNSET):
@@ -168,6 +169,9 @@ class Packet:
         self.rssi = None
         self.snr = None
         self.q = None
+        self.announce_mode = None
+        self.fragment_set = None
+        self.pq_session_ack = None
 
     def get_packed_flags(self):
         if self.context == Packet.LRPROOF:
@@ -176,6 +180,32 @@ class Packet:
             packed_flags = (self.header_type << 6) | (self.context_flag << 5) | (self.transport_type << 4) | (self.destination.type << 2) | self.packet_type
 
         return packed_flags
+    @classmethod
+    def from_fragment(cls, destination, fragment_data, packet_type=DATA, context=PQ_FRAGMENT,
+                      header_type=HEADER_1, transport_id=None, attached_interface=None,
+                      context_flag=FLAG_UNSET):
+        packet = cls(destination, bytes(fragment_data), packet_type=packet_type, context=context,
+                     header_type=header_type, transport_id=transport_id,
+                     attached_interface=attached_interface, create_receipt=False,
+                     context_flag=context_flag)
+        packet.destination_hash = destination.hash
+        packet.header = bytes([packet.flags, packet.hops])
+        if context == Packet.LRPROOF:
+            packet.header += destination.link_id
+        elif header_type == Packet.HEADER_1:
+            packet.header += destination.hash
+        elif header_type == Packet.HEADER_2 and transport_id is not None:
+            packet.header += transport_id + destination.hash
+        else:
+            raise IOError("Packet with header type 2 must have a transport ID")
+        packet.ciphertext = bytes(fragment_data)
+        packet.header += bytes([context])
+        packet.raw = packet.header + packet.ciphertext
+        if len(packet.raw) > packet.MTU:
+            raise IOError("Packet size of "+str(len(packet.raw))+" exceeds MTU of "+str(packet.MTU)+" bytes")
+        packet.packed = True
+        packet.update_hash()
+        return packet
 
     def pack(self):
         self.destination_hash = self.destination.hash
@@ -190,32 +220,15 @@ class Packet:
             if self.header_type == Packet.HEADER_1:
                 self.header += self.destination.hash
 
-                if self.packet_type == Packet.ANNOUNCE:
-                    # Announce packets are not encrypted
-                    self.ciphertext = self.data
-                elif self.packet_type == Packet.LINKREQUEST:
-                    # Link request packets are not encrypted
+                if self.packet_type == Packet.ANNOUNCE or self.packet_type == Packet.LINKREQUEST:
                     self.ciphertext = self.data
                 elif self.packet_type == Packet.PROOF and self.context == Packet.RESOURCE_PRF:
-                    # Resource proofs are not encrypted
                     self.ciphertext = self.data
                 elif self.packet_type == Packet.PROOF and self.destination.type == RNS.Destination.LINK:
-                    # Packet proofs over links are not encrypted
                     self.ciphertext = self.data
-                elif self.context == Packet.RESOURCE:
-                    # A resource takes care of encryption
-                    # by itself
-                    self.ciphertext = self.data
-                elif self.context == Packet.KEEPALIVE:
-                    # Keepalive packets contain no actual
-                    # data
-                    self.ciphertext = self.data
-                elif self.context == Packet.CACHE_REQUEST:
-                    # Cache-requests are not encrypted
+                elif self.context == Packet.RESOURCE or self.context == Packet.KEEPALIVE or self.context == Packet.CACHE_REQUEST or self.context == Packet.PQ_FRAGMENT:
                     self.ciphertext = self.data
                 else:
-                    # In all other cases, we encrypt the packet
-                    # with the destination's encryption method
                     self.ciphertext = self.destination.encrypt(self.data)
                     if hasattr(self.destination, "latest_ratchet_id"):
                         self.ratchet_id = self.destination.latest_ratchet_id
@@ -224,13 +237,10 @@ class Packet:
                 if self.transport_id != None:
                     self.header += self.transport_id
                     self.header += self.destination.hash
-
-                    if self.packet_type == Packet.ANNOUNCE:
-                        # Announce packets are not encrypted
+                    if self.packet_type == Packet.ANNOUNCE or self.context == Packet.PQ_FRAGMENT:
                         self.ciphertext = self.data
                 else:
                     raise IOError("Packet with header type 2 must have a transport ID")
-
 
         self.header += bytes([self.context])
         self.raw = self.header + self.ciphertext
@@ -277,18 +287,42 @@ class Packet:
             self.packed = False
             self.update_hash()
             return True
-
         except Exception as e:
             RNS.log(f"Received malformed packet, dropping it. The contained exception was: {e}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
             return False
 
+    def _send_pq_session(self):
+        from RNS.PQ import PQSessionManager
+        manager = getattr(RNS.Transport, "pq_session_manager", None)
+        if manager is None:
+            manager = PQSessionManager()
+        self.packet_hash = RNS.Identity.full_hash(self.data)
+        self.sent = True
+        if self.create_receipt:
+            self.receipt = PacketReceipt(self)
+            with RNS.Transport.receipts_lock:
+                RNS.Transport.receipts.append(self.receipt)
+        for fragment in fragments:
+            control = Packet.from_fragment(self.destination, fragment.pack(),
+                                           packet_type=Packet.DATA,
+                                           context=Packet.PQ_FRAGMENT,
+                                           attached_interface=self.attached_interface)
+            if not RNS.Transport.outbound(control):
+                self.sent = False
+                self.receipt = None
+                return False
+        return self.receipt
+
     def send(self):
         """
         Sends the packet.
-        
-        :returns: A :ref:`RNS.PacketReceipt<api-packetreceipt>` instance if *create_receipt* was set to *True* when the packet was instantiated, if not returns *None*. If the packet could not be sent *False* is returned.
         """
         if not self.sent:
+            if (self.context != Packet.PQ_FRAGMENT and self.destination is not None and
+                    self.destination.type == RNS.Destination.SINGLE and
+                    self.destination.identity is not None and
+                    self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY):
+                return self._send_pq_session()
             if self.hops >= RNS.Transport.PATHFINDER_M: return False
             if not self.packed: self.pack()
             if self.destination.type == RNS.Destination.LINK:
@@ -311,7 +345,7 @@ class Packet:
                 self.sent = False
                 self.receipt = None
                 return False
-                
+
         else:
             raise IOError("Packet was already sent")
 
@@ -337,7 +371,7 @@ class Packet:
 
     def prove(self, destination=None):
         if self.fromPacked and hasattr(self, "destination") and self.destination:
-            if self.destination.identity and self.destination.identity.prv:
+            if self.destination.identity and self.destination.identity.has_private_key():
                 self.destination.identity.prove(self, destination)
         elif self.fromPacked and hasattr(self, "link") and self.link: self.link.prove_packet(self)
         else: RNS.log("Could not prove packet associated with neither a destination nor a link", RNS.LOG_ERROR)
@@ -418,8 +452,9 @@ class PacketReceipt:
         self.hash           = packet.packet_hash
         self.truncated_hash = packet.truncated_packet_hash
         self.sent           = True
+        self.hash           = packet.packet_hash if packet.packet_hash is not None else packet.get_hash()
+        self.truncated_hash = RNS.Identity.truncated_hash(self.hash)
         self.sent_at        = time.time()
-        self.proved         = False
         self.status         = PacketReceipt.SENT
         self.destination    = packet.destination
         self.callbacks      = PacketReceiptCallbacks()
@@ -447,96 +482,82 @@ class PacketReceipt:
 
     # Validate a raw proof for a link
     def validate_link_proof(self, proof, link, proof_packet=None):
-        # TODO: Hardcoded as explicit proofs for now
-        if True or len(proof) == PacketReceipt.EXPL_LENGTH:
-            # This is an explicit proof
-            proof_hash = proof[:RNS.Identity.HASHLENGTH//8]
-            signature = proof[RNS.Identity.HASHLENGTH//8:RNS.Identity.HASHLENGTH//8+RNS.Identity.SIGLENGTH//8]
-            if proof_hash == self.hash:
-                proof_valid = link.validate(signature, self.hash)
-                if proof_valid:
-                    self.status = PacketReceipt.DELIVERED
-                    self.proved = True
-                    self.concluded_at = time.time()
-                    self.proof_packet = proof_packet
-                    link.last_proof = self.concluded_at
-
-                    if self.callbacks.delivery != None:
-                        try: self.callbacks.delivery(self)
-                        except Exception as e:
-                            RNS.log("An error occurred while evaluating external delivery callback for "+str(link), RNS.LOG_ERROR)
-                            RNS.log("The contained exception was: "+str(e), RNS.LOG_ERROR)
-                            RNS.trace_exception(e)
-                            
-                    return True
-                
-                else: return False
-            else: return False
-        
-        elif len(proof) == PacketReceipt.IMPL_LENGTH:
-            pass
-            # TODO: Why is this disabled?
-            # signature = proof[:RNS.Identity.SIGLENGTH//8]
-            # proof_valid = self.link.validate(signature, self.hash)
-            # if proof_valid:
-            #       self.status = PacketReceipt.DELIVERED
-            #       self.proved = True
-            #       self.concluded_at = time.time()
-            #       if self.callbacks.delivery != None:
-            #           self.callbacks.delivery(self)
-            #       RNS.log("valid")
-            #       return True
-            # else:
-            #   RNS.log("invalid")
-            #   return False
-        else: return False
+        import hmac
+        proof_hash = proof[:RNS.Identity.HASHLENGTH//8]
+        if proof_hash != self.hash:
+            return False
+        identity = getattr(getattr(link, "destination", None), "identity", None)
+        if len(proof) == RNS.Identity.HASHLENGTH//8 + 32 and identity is not None and identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+            mac = proof[RNS.Identity.HASHLENGTH//8:]
+            valid = hmac.compare_digest(mac, hmac.new(link.derived_key, self.hash, "sha256").digest())
+        else:
+            signature = proof[RNS.Identity.HASHLENGTH//8:]
+            valid = link.validate(signature, self.hash)
+        if not valid:
+            return False
+        self.status = PacketReceipt.DELIVERED
+        self.proved = True
+        self.concluded_at = time.time()
+        self.proof_packet = proof_packet
+        link.last_proof = self.concluded_at
+        if self.callbacks.delivery is not None:
+            self.callbacks.delivery(self)
+        return True
 
     # Validate a raw proof
     def validate_proof(self, proof, proof_packet=None):
-        if len(proof) == PacketReceipt.EXPL_LENGTH:
-            # This is an explicit proof
-            proof_hash = proof[:RNS.Identity.HASHLENGTH//8]
-            signature = proof[RNS.Identity.HASHLENGTH//8:RNS.Identity.HASHLENGTH//8+RNS.Identity.SIGLENGTH//8]
-            if proof_hash == self.hash and hasattr(self.destination, "identity") and self.destination.identity != None:
+        if not hasattr(self.destination, "identity") or self.destination.identity == None:
+            return False
+
+        signature_lens = [RNS.Identity._signature_size(self.destination.identity.crypto_mode)]
+        if self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID:
+            signature_lens = [RNS.Identity._legacy_signature_size(), RNS.Identity.PQ_SIG_SIGNATURE_SIZE, RNS.Identity._legacy_signature_size()+RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
+        elif self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
+            signature_lens = [RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
+        else:
+            signature_lens = [RNS.Identity._legacy_signature_size()]
+
+        for signature_len in signature_lens:
+            if len(proof) == RNS.Identity.HASHLENGTH//8 + signature_len:
+                # This is an explicit proof
+                proof_hash = proof[:RNS.Identity.HASHLENGTH//8]
+                signature = proof[RNS.Identity.HASHLENGTH//8:RNS.Identity.HASHLENGTH//8+signature_len]
+                if proof_hash == self.hash:
+                    proof_valid = self.destination.identity.validate(signature, self.hash)
+                    if proof_valid:
+                        self.status = PacketReceipt.DELIVERED
+                        self.proved = True
+                        self.concluded_at = time.time()
+                        self.proof_packet = proof_packet
+
+                        if self.callbacks.delivery != None:
+                            try: self.callbacks.delivery(self)
+                            except Exception as e:
+                                RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+                        return True
+                    
+                    else: return False
+                else: return False
+
+            elif len(proof) == signature_len:
+                # This is an implicit proof
+                signature = proof[:signature_len]
                 proof_valid = self.destination.identity.validate(signature, self.hash)
                 if proof_valid:
-                    self.status = PacketReceipt.DELIVERED
-                    self.proved = True
-                    self.concluded_at = time.time()
-                    self.proof_packet = proof_packet
+                        self.status = PacketReceipt.DELIVERED
+                        self.proved = True
+                        self.concluded_at = time.time()
+                        self.proof_packet = proof_packet
 
-                    if self.callbacks.delivery != None:
-                        try: self.callbacks.delivery(self)
-                        except Exception as e:
-                            RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
+                        if self.callbacks.delivery != None:
+                            try: self.callbacks.delivery(self)
+                            except Exception as e: RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
+                                
+                        return True
 
-                    return True
-                
                 else: return False
-            else: return False
-
-        elif len(proof) == PacketReceipt.IMPL_LENGTH:
-            # This is an implicit proof
-
-            if not hasattr(self.destination, "identity"): return False
-            if self.destination.identity == None:         return False
-
-            signature = proof[:RNS.Identity.SIGLENGTH//8]
-            proof_valid = self.destination.identity.validate(signature, self.hash)
-            if proof_valid:
-                    self.status = PacketReceipt.DELIVERED
-                    self.proved = True
-                    self.concluded_at = time.time()
-                    self.proof_packet = proof_packet
-
-                    if self.callbacks.delivery != None:
-                        try: self.callbacks.delivery(self)
-                        except Exception as e: RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
-                            
-                    return True
-
-            else: return False
-        else: return False
+        return False
 
     def get_rtt(self):
         """

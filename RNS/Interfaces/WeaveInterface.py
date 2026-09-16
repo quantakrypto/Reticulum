@@ -106,6 +106,8 @@ class WDCL():
         self.discovery_modulation = None
 
         self.switch_identity = owner.switch_identity
+        if self.switch_identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+            raise ValueError("Weave interface requires a legacy Ed25519 switch identity")
         self.switch_id = self.switch_identity.sig_pub_bytes[-4:]
         self.switch_pub_bytes = self.switch_identity.sig_pub_bytes
 

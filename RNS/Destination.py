@@ -242,80 +242,60 @@ class Destination:
         return False
 
     def announce(self, app_data=None, path_response=False, attached_interface=None, tag=None, send=True):
-        """
-        Creates an announce packet for this destination and broadcasts it on all
-        relevant interfaces. Application specific data can be added to the announce.
-
-        :param app_data: *bytes* containing the app_data.
-        :param path_response: Internal flag used by :ref:`RNS.Transport<api-transport>`. Ignore.
-        """
-        if self.type != Destination.SINGLE:
-            raise TypeError("Only SINGLE destination types can be announced")
-
-        if self.direction != Destination.IN:
-            raise TypeError("Only IN destination types can be announced")
-        
-        ratchet = b""
+        """Announce this destination, fragmenting only PQ/hybrid records."""
         now = time.time()
-        stale_responses = []
-        for entry_tag in self.path_responses:
-            entry = self.path_responses[entry_tag]
-            if now > entry[0]+Destination.PR_TAG_WINDOW:
-                stale_responses.append(entry_tag)
-
+        stale_responses = [entry_tag for entry_tag, entry in self.path_responses.items()
+                           if now > entry[0] + Destination.PR_TAG_WINDOW]
         for entry_tag in stale_responses:
             self.path_responses.pop(entry_tag)
 
-        if (path_response == True and tag != None) and tag in self.path_responses:
-            # This code is currently not used, since Transport will block duplicate
-            # path requests based on tags. When multi-path support is implemented in
-            # Transport, this will allow Transport to detect redundant paths to the
-            # same destination, and select the best one based on chosen criteria,
-            # since it will be able to detect that a single emitted announce was
-            # received via multiple paths. The difference in reception time will
-            # potentially also be useful in determining characteristics of the
-            # multiple available paths, and to choose the best one.
-            RNS.log("Using cached announce data for answering path request with tag "+RNS.prettyhexrep(tag), RNS.LOG_EXTREME)
-            announce_data = self.path_responses[tag][1]
-        
+        cached_context_flag = RNS.Packet.FLAG_UNSET
+        if path_response and tag is not None and tag in self.path_responses:
+            entry = self.path_responses[tag]
+            announce_data = entry[1]
+            if len(entry) > 2:
+                cached_context_flag = entry[2]
         else:
             destination_hash = self.hash
-            random_hash = RNS.Identity.get_random_hash()[0:5]+int(time.time()).to_bytes(5, "big")
-
+            random_hash = RNS.Identity.get_random_hash()[0:5] + int(time.time()).to_bytes(5, "big")
+            ratchet = b""
             if self.ratchets != None:
                 self.rotate_ratchets()
                 ratchet = RNS.Identity._ratchet_public_bytes(self.ratchets[0])
                 RNS.Identity._remember_ratchet(self.hash, ratchet)
-
-            if app_data == None and self.default_app_data != None:
-                if isinstance(self.default_app_data, bytes):
-                    app_data = self.default_app_data
-                elif callable(self.default_app_data):
-                    returned_app_data = self.default_app_data()
-                    if isinstance(returned_app_data, bytes):
-                        app_data = returned_app_data
-            
-            signed_data = self.hash+self.identity.get_public_key()+self.name_hash+random_hash+ratchet
-            if app_data != None: signed_data += app_data
-
+            if app_data is None and self.default_app_data is not None:
+                returned_app_data = self.default_app_data() if callable(self.default_app_data) else self.default_app_data
+                if isinstance(returned_app_data, bytes):
+                    app_data = returned_app_data
+            signed_data = self.hash + self.identity.get_public_key() + self.name_hash + random_hash + ratchet
+            if app_data is not None:
+                signed_data += app_data
             signature = self.identity.sign(signed_data)
-            announce_data = self.identity.get_public_key()+self.name_hash+random_hash+ratchet+signature
+            announce_data = self.identity.get_public_key() + self.name_hash + random_hash + ratchet + signature
+            if app_data is not None:
+                announce_data += app_data
+            cached_context_flag = RNS.Packet.FLAG_SET if ratchet else RNS.Packet.FLAG_UNSET
+            if tag is not None:
+                self.path_responses[tag] = [time.time(), announce_data, cached_context_flag]
 
-            if app_data != None: announce_data += app_data
+        announce_context = RNS.Packet.PATH_RESPONSE if path_response else RNS.Packet.NONE
+        if self.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+            from RNS.PQ import PQAnnounceTransfer
+            transfer = PQAnnounceTransfer(self, announce_data, announce_context,
+                                          context_flag=cached_context_flag,
+                                          attached_interface=attached_interface)
+            if send:
+                transfer.send()
+                return transfer
+            return transfer
 
-            self.path_responses[tag] = [time.time(), announce_data]
-
-        if path_response: announce_context = RNS.Packet.PATH_RESPONSE
-        else:             announce_context = RNS.Packet.NONE
-
-        if ratchet: context_flag = RNS.Packet.FLAG_SET
-        else:       context_flag = RNS.Packet.FLAG_UNSET
-
-        announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE, context = announce_context,
-                                     attached_interface = attached_interface, context_flag=context_flag)
-        
-        if send: announce_packet.send()
-        else:    return announce_packet
+        announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE,
+                                     context=announce_context, attached_interface=attached_interface,
+                                     context_flag=cached_context_flag)
+        if send:
+            announce_packet.send()
+            return announce_packet
+        return announce_packet
 
     def accepts_links(self, accepts = None):
         """
