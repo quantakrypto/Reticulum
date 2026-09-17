@@ -296,6 +296,8 @@ class Packet:
         manager = getattr(RNS.Transport, "pq_session_manager", None)
         if manager is None:
             manager = PQSessionManager()
+            RNS.Transport.pq_session_manager = manager
+        _, _, fragments = manager.create_request(self.destination, self.data)
         self.packet_hash = RNS.Identity.full_hash(self.data)
         self.sent = True
         if self.create_receipt:
@@ -318,7 +320,8 @@ class Packet:
         Sends the packet.
         """
         if not self.sent:
-            if (self.context != Packet.PQ_FRAGMENT and self.destination is not None and
+            if (self.packet_type == Packet.DATA and
+                    self.context != Packet.PQ_FRAGMENT and self.destination is not None and
                     self.destination.type == RNS.Destination.SINGLE and
                     self.destination.identity is not None and
                     self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY):

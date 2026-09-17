@@ -37,6 +37,7 @@ RECORD_SESSION_REQUEST = 4
 RECORD_SESSION_ACK = 5
 RECORD_SESSION_DATA = 6
 RECORD_PROOF = 7
+FRAGMENT_RETRANSMIT_FLAG = 0x80
 
 
 class PQFragment:
@@ -123,8 +124,10 @@ class FragmentAssembler:
                 entry = {"count": fragment.fragment_count, "total": fragment.total_length,
                          "flags": fragment.flags, "parts": {}, "bytes": 0, "updated": now}
                 self._records[key] = entry
-            elif (entry["count"], entry["total"], entry["flags"]) != (
-                    fragment.fragment_count, fragment.total_length, fragment.flags):
+            elif (entry["count"], entry["total"],
+                    entry["flags"] & ~FRAGMENT_RETRANSMIT_FLAG) != (
+                    fragment.fragment_count, fragment.total_length,
+                    fragment.flags & ~FRAGMENT_RETRANSMIT_FLAG):
                 raise ValueError("conflicting PQ fragment manifest")
 
             existing = entry["parts"].get(fragment.fragment_index)

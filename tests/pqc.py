@@ -1,15 +1,80 @@
 import hashlib
-import unittest
 import hmac
 import time
+import unittest
+from unittest.mock import patch
+
 import RNS
 from RNS.PQ import (
     FragmentAssembler, PQAnnounceTransfer, PQFragment, PQSessionManager,
     fragment_record, fragment_payload_size, RECORD_SESSION_DATA,
+    FRAGMENT_RETRANSMIT_FLAG,
 )
 
 
 class TestPQFragments(unittest.TestCase):
+    def test_fragmented_announce_enters_transport_inbound(self):
+        class IdentityStub:
+            crypto_mode = RNS.Identity.CRYPTO_PQ
+
+        class DestinationStub:
+            type = RNS.Destination.SINGLE
+            hash = b"X" * (RNS.Reticulum.TRUNCATED_HASHLENGTH // 8)
+            identity = IdentityStub()
+
+        class InterfaceStub:
+            HW_MTU = RNS.Reticulum.MTU
+            ifac_size = 0
+            def should_ingress_limit(self): return False
+            def received_announce(self, size): pass
+
+        inbound = unittest.mock.Mock()
+        transport = RNS.Transport
+        with patch.object(transport, "ready", True), \
+             patch.object(transport, "identity", object()), \
+             patch.object(transport, "pq_fragment_assembler", FragmentAssembler()), \
+             patch.object(transport, "packet_filter", staticmethod(lambda packet: True)), \
+             patch.object(transport, "USE_INBOUND_QUEUE", False), \
+             patch.object(transport, "pr_destination_hash",
+                          b"Y" * (RNS.Identity.TRUNCATED_HASHLENGTH // 8)), \
+             patch.object(transport, "_inbound", staticmethod(inbound)), \
+             patch.object(RNS.Identity, "validate_announce",
+                          staticmethod(lambda *args, **kwargs: True)):
+            transfer = PQAnnounceTransfer(DestinationStub(), b"a" * 2000, RNS.Packet.NONE)
+            interface = InterfaceStub()
+            for packet in transfer.packets:
+                transport.preprocess_inbound(packet.raw, interface=interface)
+
+        inbound.assert_called_once()
+        logical_packet = inbound.call_args.args[0]
+        self.assertEqual(logical_packet.data, b"a" * 2000)
+        self.assertEqual(len(logical_packet.fragment_set), len(transfer.packets))
+        self.assertEqual(logical_packet.packet_hash, logical_packet.get_hash())
+        cached_packet = RNS.Packet(None, logical_packet.raw)
+        self.assertTrue(cached_packet.unpack())
+        self.assertEqual(cached_packet.data, logical_packet.data)
+
+        class TransportIdentityStub:
+            hash = b"T" * (RNS.Reticulum.TRUNCATED_HASHLENGTH // 8)
+
+        with patch.object(transport, "identity", TransportIdentityStub()), \
+             patch.object(RNS.Identity, "parse_announce",
+                          staticmethod(lambda *args, **kwargs: {
+                              "mode": RNS.Identity.CRYPTO_PQ,
+                          })):
+            retransmitted = transport._announce_retransmit_packets(
+                cached_packet, DestinationStub(), RNS.Packet.PATH_RESPONSE,
+                None, logical_packet.hops)
+
+        self.assertGreater(len(retransmitted), 1)
+        self.assertTrue(all(packet.context == RNS.Packet.PQ_FRAGMENT
+                            for packet in retransmitted))
+        assembler = FragmentAssembler()
+        recovered = None
+        for packet in retransmitted:
+            recovered = assembler.add(PQFragment.unpack(packet.data))
+        self.assertEqual(recovered, logical_packet.data)
+
     def test_announce_transfer_keeps_one_fragmented_representation(self):
         class IdentityStub:
             crypto_mode = RNS.Identity.CRYPTO_PQ
@@ -48,6 +113,37 @@ class TestPQFragments(unittest.TestCase):
             result = assembler.add(fragment)
         self.assertEqual(result, payload)
         self.assertEqual(len(assembler), 0)
+
+    def test_retransmitted_announce_fragments_complete_partial_record(self):
+        payload = b"retransmit-me" * 250
+        initial = fragment_record(1, payload, flags=0x20)
+        retry = fragment_record(1, payload,
+                                flags=0x20 | FRAGMENT_RETRANSMIT_FLAG)
+        assembler = FragmentAssembler()
+        self.assertNotEqual(initial[0].pack(), retry[0].pack())
+
+        for fragment in initial[:-1]:
+            self.assertIsNone(assembler.add(fragment))
+
+        result = None
+        for fragment in retry:
+            result = assembler.add(fragment)
+
+        self.assertEqual(result, payload)
+
+    def test_pq_fragments_use_distinct_announce_queue_keys(self):
+        class IdentityStub:
+            crypto_mode = RNS.Identity.CRYPTO_PQ
+
+        class DestinationStub:
+            type = RNS.Destination.SINGLE
+            hash = b"\x03" * (RNS.Reticulum.TRUNCATED_HASHLENGTH // 8)
+            identity = IdentityStub()
+
+        transfer = PQAnnounceTransfer(DestinationStub(), b"q" * 2000, RNS.Packet.NONE)
+        keys = [RNS.Transport._announce_queue_key(packet) for packet in transfer.packets]
+
+        self.assertEqual(len(keys), len(set(keys)))
 
     def test_conflicting_duplicate_and_tamper_are_rejected(self):
         payload = b"record" * 100

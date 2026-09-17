@@ -416,36 +416,56 @@ class Transport:
         logical.destination_hash = packet.destination_hash
         logical.destination_type = packet.destination_type
         logical.header_type = packet.header_type
+        logical.transport_type = packet.transport_type
         logical.transport_id = packet.transport_id
         logical.context = (fragment.flags >> 1) & 0x0F
         logical.context_flag = fragment.flags & 0x01
-        mode_flags = (fragment.flags >> 5) & 0x07
+        mode_flags = (fragment.flags >> 5) & 0x03
         logical.announce_mode = {
             1: RNS.Identity.CRYPTO_PQ,
             2: RNS.Identity.CRYPTO_HYBRID,
         }.get(mode_flags)
         logical.data = assembled
-        logical.packet_hash = fragment.record_id
         logical.fragment_set = fragment_set
         logical.hops = packet.hops
         logical.receiving_interface = packet.receiving_interface
         logical.rssi = packet.rssi
         logical.snr = packet.snr
         logical.q = packet.q
+        logical.flags = packet.flags
+        logical.header = bytes([logical.flags, logical.hops])
+        if logical.header_type == RNS.Packet.HEADER_2:
+            logical.header += logical.transport_id
+        logical.header += logical.destination_hash + bytes([logical.context])
+        logical.ciphertext = assembled
+        logical.raw = logical.header + logical.ciphertext
+        logical.packed = True
+        logical.update_hash()
         return logical
     @staticmethod
     def _announce_retransmit_packets(packet, destination, context, attached_interface,
                                      hop_count, block_rebroadcasts=False):
-        if packet.fragment_set:
-            from RNS.PQ import PQFragment
+        announce_mode = packet.announce_mode
+        if announce_mode is None:
+            announce_mode = RNS.Identity.parse_announce(
+                packet.data, packet.context_flag)["mode"]
+        if announce_mode != RNS.Identity.CRYPTO_LEGACY:
+            from RNS.PQ import (fragment_record, RECORD_ANNOUNCE,
+                                FRAGMENT_RETRANSMIT_FLAG)
+            mode_flags = {
+                RNS.Identity.CRYPTO_PQ: 0x20,
+                RNS.Identity.CRYPTO_HYBRID: 0x40,
+            }[announce_mode]
+            retry_flag = 0
+            if packet.fragment_set:
+                retry_flag = FRAGMENT_RETRANSMIT_FLAG ^ (
+                    packet.fragment_set[0].flags & FRAGMENT_RETRANSMIT_FLAG)
+            fragment_flags = mode_flags | retry_flag | ((context & 0x0F) << 1) | (packet.context_flag & 0x01)
+            fragments = fragment_record(
+                RECORD_ANNOUNCE, packet.data, flags=fragment_flags,
+                header_type=RNS.Packet.HEADER_2, mtu=RNS.Reticulum.MTU)
             packets = []
-            for fragment in packet.fragment_set:
-                flags = ((fragment.flags & ~0x1E) |
-                         ((context & 0x0F) << 1) |
-                         (packet.context_flag & 0x01))
-                fragment = PQFragment(fragment.record_kind, fragment.record_id,
-                                      fragment.fragment_index, fragment.fragment_count,
-                                      fragment.total_length, fragment.payload, flags)
+            for fragment in fragments:
                 item = RNS.Packet.from_fragment(
                     destination, fragment.pack(), packet_type=RNS.Packet.ANNOUNCE,
                     context=RNS.Packet.PQ_FRAGMENT, header_type=RNS.Packet.HEADER_2,
@@ -950,7 +970,6 @@ class Transport:
                                     attached_interface = announce_entry[IDX_AT_ATTCHD_IF]
                                     announce_context = RNS.Packet.NONE
                                     if block_rebroadcasts: announce_context = RNS.Packet.PATH_RESPONSE
-                                    announce_data = packet.data
                                     announce_identity = RNS.Identity.recall(packet.destination_hash, _no_use=True)
                                     if not announce_identity:
                                         RNS.log("Completed announce processing for "+RNS.prettyhexrep(destination_hash)+", the path was cleaned while waiting for announce rebroadcast", RNS.LOG_PATHING) if RNS.sl(RNS.LOG_PATHING) else None
@@ -1697,13 +1716,17 @@ class Transport:
                                             should_queue = True
 
                                             already_queued = False
+                                            queue_key = Transport._announce_queue_key(packet)
                                             for e in interface.announce_queue:
-                                                if e["destination"] == packet.destination_hash:
+                                                if e["destination"] == queue_key:
                                                     already_queued = True
                                                     existing_entry = e
                                                     break
 
-                                            emission_timestamp = Transport.announce_emitted(packet)
+                                            if packet.context == RNS.Packet.PQ_FRAGMENT:
+                                                emission_timestamp = outbound_time
+                                            else:
+                                                emission_timestamp = Transport.announce_emitted(packet)
                                             if already_queued:
                                                 should_queue = False
 
@@ -1714,10 +1737,10 @@ class Transport:
                                                     existing_entry["raw"] = packet.raw
 
                                             if should_queue:
-                                                entry = { "destination": packet.destination_hash,
+                                                entry = { "destination": queue_key,
                                                           "time": outbound_time,
                                                           "hops": packet.hops,
-                                                          "emitted": Transport.announce_emitted(packet),
+                                                          "emitted": emission_timestamp,
                                                           "raw": packet.raw }
 
                                                 queued_announces = True if len(interface.announce_queue) > 0 else False
@@ -1957,6 +1980,16 @@ class Transport:
 
         Transport.rx_packets += 1
         packet.receiving_interface = interface
+        # PQ announces are authenticated only after all fragments have been
+        # reassembled into the canonical announce payload.
+        if packet.packet_type == RNS.Packet.ANNOUNCE and packet.context == RNS.Packet.PQ_FRAGMENT:
+            try:
+                packet = Transport._reassemble_announce(packet)
+            except (MemoryError, TypeError, ValueError):
+                return interface.protocol_violation("Malformed PQ announce fragment") if interface else None
+            if packet is None:
+                return
+
         packet.hops += 1
 
         # Ingress limit announces early
@@ -2381,11 +2414,11 @@ class Transport:
                     local_and_hops_condition = (packet.hops < Transport.PATHFINDER_M+1) and (not packet.destination_hash in Transport.destinations_map)
 
                 if local_and_hops_condition:
-                    announce_emitted = Transport.announce_emitted(packet)
-                    
+                    announce = RNS.Identity.parse_announce(packet.data, packet.context_flag)
+                    announce_emitted = Transport.timebase_from_random_blob(announce["random_hash"])
+
                     random_blobs = []
-                    random_blob  = packet.data[RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.NAME_HASH_LENGTH//8+10]
-                    if not random_blob: return packet.receiving_interface.protocol_violation("No random blob in data") if packet.receiving_interface else None
+                    random_blob = announce["random_hash"]
 
                     with Transport.inbound_announce_lock:
                         announced_destination_known = packet.destination_hash in Transport.path_table
@@ -2573,30 +2606,24 @@ class Transport:
                                 announce_destination.hash = packet.destination_hash
                                 announce_destination.hexhash = announce_destination.hash.hex()
                                 announce_context = RNS.Packet.NONE
-                                announce_data = packet.data
 
                                 # TODO: Shouldn't the context be PATH_RESPONSE in the first case here?
                                 if is_from_local_client and packet.context == RNS.Packet.PATH_RESPONSE:
                                     for local_interface in Transport.local_client_interfaces:
                                         if packet.receiving_interface != local_interface:
-                                            new_announce = RNS.Packet(announce_destination, announce_data, RNS.Packet.ANNOUNCE, # <-- This one?
-                                                                      context = announce_context, header_type = RNS.Packet.HEADER_2,
-                                                                      transport_type = Transport.TRANSPORT, transport_id = Transport.identity.hash,
-                                                                      attached_interface = local_interface, context_flag = packet.context_flag)
-                                            
-                                            new_announce.hops = packet.hops
-                                            new_announce.send()
-
+                                            new_packets = Transport._announce_retransmit_packets(
+                                                packet, announce_destination, announce_context,
+                                                local_interface, packet.hops)
+                                            for new_announce in new_packets:
+                                                new_announce.send()
                                 else:
                                     for local_interface in Transport.local_client_interfaces:
                                         if packet.receiving_interface != local_interface:
-                                            new_announce = RNS.Packet(announce_destination, announce_data, RNS.Packet.ANNOUNCE,
-                                                                      context = announce_context, header_type = RNS.Packet.HEADER_2,
-                                                                      transport_type = Transport.TRANSPORT, transport_id = Transport.identity.hash,
-                                                                      attached_interface = local_interface, context_flag = packet.context_flag)
-
-                                            new_announce.hops = packet.hops
-                                            new_announce.send()
+                                            new_packets = Transport._announce_retransmit_packets(
+                                                packet, announce_destination, announce_context,
+                                                local_interface, packet.hops)
+                                            for new_announce in new_packets:
+                                                new_announce.send()
 
                             # If we have any waiting discovery path requests
                             # for this destination, we retransmit to that
@@ -2613,16 +2640,12 @@ class Transport:
                                     announce_destination = RNS.Destination(announce_identity, RNS.Destination.OUT, RNS.Destination.SINGLE, "unknown", "unknown");
                                     announce_destination.hash = packet.destination_hash
                                     announce_destination.hexhash = announce_destination.hash.hex()
-                                    announce_context = RNS.Packet.NONE
-                                    announce_data = packet.data
 
-                                    new_announce = RNS.Packet(announce_destination, announce_data, RNS.Packet.ANNOUNCE,
-                                                              context = RNS.Packet.PATH_RESPONSE, header_type = RNS.Packet.HEADER_2,
-                                                              transport_type = Transport.TRANSPORT, transport_id = Transport.identity.hash,
-                                                              attached_interface = attached_interface, context_flag = packet.context_flag)
-
-                                    new_announce.hops = packet.hops
-                                    new_announce.send()
+                                    new_packets = Transport._announce_retransmit_packets(
+                                        packet, announce_destination, RNS.Packet.PATH_RESPONSE,
+                                        attached_interface, packet.hops)
+                                    for new_announce in new_packets:
+                                        new_announce.send()
 
                             if not Transport.owner.is_connected_to_shared_instance: Transport.cache(packet, force_cache=True, packet_type="announce")
                             path_table_entry = [now, received_from, announce_hops, expires, random_blobs, packet.receiving_interface, packet.packet_hash]
@@ -3896,8 +3919,16 @@ class Transport:
         for random_blob in random_blobs:
             emitted = Transport.timebase_from_random_blob(random_blob)
             if emitted > timebase: timebase = emitted
-
         return timebase
+
+    @staticmethod
+    def _announce_queue_key(packet):
+        if packet.context == RNS.Packet.PQ_FRAGMENT:
+            from RNS.PQ import PQFragment
+            fragment = PQFragment.unpack(packet.data)
+            return (packet.destination_hash + fragment.record_id +
+                    fragment.fragment_index.to_bytes(2, "big"))
+        return packet.destination_hash
 
     @staticmethod
     def announce_emitted(packet):
