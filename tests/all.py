@@ -4,6 +4,7 @@ from .hashes import TestSHA256
 from .hashes import TestSHA512
 from .identity import TestIdentity
 from .link import TestLink
+from .pqc import TestPQFragments
 from .channel import TestChannel
 from .hkdf import TestHKDF
 from .ifac import TestIFAC

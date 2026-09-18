@@ -100,7 +100,6 @@ class Identity:
     known_destinations_lock = threading.Lock()
 
     CRYPTO_LEGACY = "legacy"
-    CRYPTO_HYBRID = "hybrid"
     CRYPTO_PQ = "pq"
     CRYPTO_DEFAULT = CRYPTO_LEGACY
     KEY_FORMAT_MAGIC = b"RNSPQ1"
@@ -116,23 +115,11 @@ class Identity:
     CRYPTO_MODE = CRYPTO_DEFAULT
     @staticmethod
     def set_crypto_mode(mode):
-        if mode not in [Identity.CRYPTO_LEGACY, Identity.CRYPTO_HYBRID, Identity.CRYPTO_PQ]:
+        if mode not in [Identity.CRYPTO_LEGACY, Identity.CRYPTO_PQ]:
             raise ValueError("Unknown identity crypto mode: "+str(mode))
-        if mode != Identity.CRYPTO_LEGACY and not RNS.Cryptography.pq_available():
+        if mode == Identity.CRYPTO_PQ and not RNS.Cryptography.pq_available():
             raise RuntimeError(f"Crypto mode '{mode}' requires ML-KEM-768 and ML-DSA-65 capability")
         Identity.CRYPTO_MODE = mode
-
-    @staticmethod
-    def _is_hybrid_mode(mode=None):
-        if mode == None:
-            mode = Identity.CRYPTO_MODE
-        return mode == Identity.CRYPTO_HYBRID
-
-    @staticmethod
-    def _is_pq_mode(mode=None):
-        if mode == None:
-            mode = Identity.CRYPTO_MODE
-        return mode in [Identity.CRYPTO_HYBRID, Identity.CRYPTO_PQ]
 
     @staticmethod
     def _legacy_private_size():
@@ -150,8 +137,6 @@ class Identity:
     def _public_key_size(mode=None):
         if mode == None:
             mode = Identity.CRYPTO_MODE
-        if mode == Identity.CRYPTO_HYBRID:
-            return Identity._legacy_public_size() + Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE
         if mode == Identity.CRYPTO_PQ:
             return Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE
         if mode == Identity.CRYPTO_LEGACY:
@@ -162,8 +147,6 @@ class Identity:
     def _private_key_size(mode=None):
         if mode == None:
             mode = Identity.CRYPTO_MODE
-        if mode == Identity.CRYPTO_HYBRID:
-            return Identity._legacy_private_size() + Identity.PQ_KEM_PRIVATE_SIZE + Identity.PQ_SIG_PRIVATE_SIZE
         if mode == Identity.CRYPTO_PQ:
             return Identity.PQ_KEM_PRIVATE_SIZE + Identity.PQ_SIG_PRIVATE_SIZE
         if mode == Identity.CRYPTO_LEGACY:
@@ -174,35 +157,17 @@ class Identity:
     def _signature_size(mode=None):
         if mode == None:
             mode = Identity.CRYPTO_MODE
-        if mode == Identity.CRYPTO_HYBRID:
-            return Identity._legacy_signature_size() + Identity.PQ_SIG_SIGNATURE_SIZE
         if mode == Identity.CRYPTO_PQ:
             return Identity.PQ_SIG_SIGNATURE_SIZE
         if mode == Identity.CRYPTO_LEGACY:
             return Identity._legacy_signature_size()
         raise ValueError("Unknown identity crypto mode")
 
-    @staticmethod
-    def split_signature(mode, signature):
-        """Return the mode-specific signature components or reject it."""
-        signature = bytes(signature)
-        if mode == Identity.CRYPTO_LEGACY:
-            if len(signature) != Identity._legacy_signature_size():
-                raise ValueError("Invalid legacy signature length")
-            return {"classical": signature}
-        if mode == Identity.CRYPTO_PQ:
-            if len(signature) != Identity.PQ_SIG_SIGNATURE_SIZE:
-                raise ValueError("Invalid PQ signature length")
-            return {"pq": signature}
-        if mode == Identity.CRYPTO_HYBRID:
-            classical_size = Identity._legacy_signature_size()
-            if len(signature) != classical_size + Identity.PQ_SIG_SIGNATURE_SIZE:
-                raise ValueError("Invalid hybrid signature length")
-            return {"classical": signature[:classical_size], "pq": signature[classical_size:]}
-        raise ValueError("Unknown identity crypto mode")
 
     @staticmethod
     def _serialize_key_bundle(mode, public_key=None, private_key=None):
+        if mode != Identity.CRYPTO_PQ:
+            raise ValueError("Tagged bundles are only valid for PQ identities")
         payload = {"version": Identity.KEY_FORMAT_VERSION, "mode": mode,
                    "algorithms": {"kem": Identity.PQ_KEM_ALGORITHM, "sig": Identity.PQ_SIG_ALGORITHM}}
         if public_key != None:
@@ -221,8 +186,8 @@ class Identity:
         if payload.get("version") != Identity.KEY_FORMAT_VERSION:
             raise ValueError("Unsupported identity key bundle version")
         mode = payload.get("mode")
-        if mode not in [Identity.CRYPTO_PQ, Identity.CRYPTO_HYBRID]:
-            raise ValueError("Tagged bundles are only valid for PQ or hybrid identities")
+        if mode != Identity.CRYPTO_PQ:
+            raise ValueError("Tagged bundles are only valid for PQ identities")
         algorithms = payload.get("algorithms")
         if algorithms != {"kem": Identity.PQ_KEM_ALGORITHM, "sig": Identity.PQ_SIG_ALGORITHM}:
             raise ValueError("Unsupported PQ algorithms in identity key bundle")
@@ -234,13 +199,15 @@ class Identity:
     @staticmethod
     def _validate_bundle_fields(payload, private=False):
         mode = payload["mode"]
+        if mode != Identity.CRYPTO_PQ:
+            raise ValueError("Tagged bundles are only valid for PQ identities")
         public = payload.get("public_key")
         secret = payload.get("private_key")
         if not isinstance(public, dict) or set(public) != {"classical", "classical_sig", "pq", "pq_sig"}:
             raise ValueError("Invalid public key bundle fields")
         expected_public = {
-            "classical": Identity._legacy_public_size() if mode == Identity.CRYPTO_HYBRID else None,
-            "classical_sig": Identity._legacy_signature_size() if mode == Identity.CRYPTO_HYBRID else None,
+            "classical": None,
+            "classical_sig": None,
             "pq": Identity.PQ_KEM_PUBLIC_SIZE,
             "pq_sig": Identity.PQ_SIG_PUBLIC_SIZE,
         }
@@ -255,8 +222,8 @@ class Identity:
             if not isinstance(secret, dict) or set(secret) != {"classical", "classical_sig", "pq", "pq_sig"}:
                 raise ValueError("Invalid private key bundle fields")
             expected_private = {
-                "classical": Identity._legacy_private_size()//2 if mode == Identity.CRYPTO_HYBRID else None,
-                "classical_sig": Identity._legacy_private_size()//2 if mode == Identity.CRYPTO_HYBRID else None,
+                "classical": None,
+                "classical_sig": None,
                 "pq": Identity.PQ_KEM_PRIVATE_SIZE,
                 "pq_sig": Identity.PQ_SIG_PRIVATE_SIZE,
             }
@@ -272,8 +239,7 @@ class Identity:
     @staticmethod
     def remember(packet_hash, destination_hash, public_key, app_data = None):
         valid_sizes = [Identity._legacy_public_size(),
-                       Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE,
-                       Identity._legacy_public_size() + Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE]
+                       Identity.PQ_KEM_PUBLIC_SIZE + Identity.PQ_SIG_PUBLIC_SIZE]
         if len(public_key) not in valid_sizes:
             raise TypeError("Can't remember "+RNS.prettyhexrep(destination_hash)+", the public key size of "+str(len(public_key))+" is not valid.", RNS.LOG_ERROR)
         else:
@@ -695,7 +661,7 @@ class Identity:
     def parse_announce(data, context_flag=0, mode=None):
         """Parse a complete canonical announce payload without global-mode guesses."""
         if mode is None:
-            candidates = [Identity.CRYPTO_HYBRID, Identity.CRYPTO_PQ, Identity.CRYPTO_LEGACY]
+            candidates = [Identity.CRYPTO_PQ, Identity.CRYPTO_LEGACY]
         else:
             candidates = [mode]
         ratchet_size = Identity.RATCHETSIZE//8 if context_flag == RNS.Packet.FLAG_SET else 0
@@ -871,8 +837,10 @@ class Identity:
 
     def create_keys(self):
         mode = self.crypto_mode
-        if mode != Identity.CRYPTO_LEGACY and not RNS.Cryptography.pq_available():
+        if mode == Identity.CRYPTO_PQ and not RNS.Cryptography.pq_available():
             raise RuntimeError(f"Crypto mode '{mode}' requires ML-KEM-768 and ML-DSA-65 capability")
+        if mode not in (Identity.CRYPTO_LEGACY, Identity.CRYPTO_PQ):
+            raise ValueError("Unknown identity crypto mode")
 
         self.prv = None
         self.prv_bytes = None
@@ -911,7 +879,7 @@ class Identity:
             self.sig_pub = None
             self.sig_pub_bytes = None
 
-        else:
+        elif mode == Identity.CRYPTO_LEGACY:
             self.prv           = X25519PrivateKey.generate()
             self.prv_bytes     = self.prv.private_bytes()
 
@@ -923,26 +891,8 @@ class Identity:
 
             self.sig_pub       = self.sig_prv.public_key()
             self.sig_pub_bytes = self.sig_pub.public_bytes()
-
-            if mode == Identity.CRYPTO_HYBRID:
-                self.pq_prv       = MLKEMPrivateKey.generate()
-                self.pq_prv_bytes = self.pq_prv.private_bytes()
-                self.pq_pub       = self.pq_prv.public_key()
-                self.pq_pub_bytes  = self.pq_pub.public_bytes()
-
-                self.pq_sig_prv       = MLDSAPrivateKey.generate()
-                self.pq_sig_prv_bytes  = self.pq_sig_prv.private_bytes()
-                self.pq_sig_pub        = self.pq_sig_prv.public_key()
-                self.pq_sig_pub_bytes  = self.pq_sig_pub.public_bytes()
-            else:
-                self.pq_prv = None
-                self.pq_prv_bytes = None
-                self.pq_pub = None
-                self.pq_pub_bytes = None
-                self.pq_sig_prv = None
-                self.pq_sig_prv_bytes = None
-                self.pq_sig_pub = None
-                self.pq_sig_pub_bytes = None
+        else:
+            raise ValueError("Unknown identity crypto mode")
 
         self.update_hashes()
 
@@ -952,17 +902,19 @@ class Identity:
         """Return the canonical private identity material."""
         if self.crypto_mode == Identity.CRYPTO_LEGACY and self.prv_bytes and self.sig_prv_bytes:
             return self.prv_bytes+self.sig_prv_bytes
-        if self.crypto_mode in [Identity.CRYPTO_PQ, Identity.CRYPTO_HYBRID] and self.pq_prv_bytes and self.pq_sig_prv_bytes:
+        if self.crypto_mode == Identity.CRYPTO_PQ and self.pq_prv_bytes and self.pq_sig_prv_bytes:
             return self.serialize_private_key()
         return None
 
     def serialize_private_key(self):
         if self.crypto_mode == Identity.CRYPTO_LEGACY:
             return self.get_private_key()
-        payload = {"mode": self.crypto_mode,
-                   "public_key": self._public_public_bundle(),
-                   "private_key": self._public_private_bundle()}
-        return Identity._serialize_key_bundle(self.crypto_mode, payload["public_key"], payload["private_key"])
+        if self.crypto_mode == Identity.CRYPTO_PQ:
+            payload = {"mode": self.crypto_mode,
+                       "public_key": self._public_public_bundle(),
+                       "private_key": self._public_private_bundle()}
+            return Identity._serialize_key_bundle(self.crypto_mode, payload["public_key"], payload["private_key"])
+        raise ValueError("Unknown identity crypto mode")
 
     def get_public_key(self):
         """Return the raw public bundle used in identity/destination hashes."""
@@ -970,14 +922,14 @@ class Identity:
             return self.pub_bytes+self.sig_pub_bytes
         if self.crypto_mode == Identity.CRYPTO_PQ and self.pq_pub_bytes and self.pq_sig_pub_bytes:
             return self.pq_pub_bytes+self.pq_sig_pub_bytes
-        if self.crypto_mode == Identity.CRYPTO_HYBRID and self.pub_bytes and self.sig_pub_bytes and self.pq_pub_bytes and self.pq_sig_pub_bytes:
-            return self.pub_bytes+self.sig_pub_bytes+self.pq_pub_bytes+self.pq_sig_pub_bytes
         return None
 
     def serialize_public_key(self):
         if self.crypto_mode == Identity.CRYPTO_LEGACY:
             return self.get_public_key()
-        return Identity._serialize_key_bundle(self.crypto_mode, self._public_public_bundle())
+        if self.crypto_mode == Identity.CRYPTO_PQ:
+            return Identity._serialize_key_bundle(self.crypto_mode, self._public_public_bundle())
+        raise ValueError("Unknown identity crypto mode")
 
     def _public_public_bundle(self):
         return {"classical": self.pub_bytes, "classical_sig": self.sig_pub_bytes,
@@ -992,34 +944,26 @@ class Identity:
             return self.prv is not None and self.sig_prv is not None
         if self.crypto_mode == Identity.CRYPTO_PQ:
             return self.pq_prv is not None and self.pq_sig_prv is not None
-        return all(key is not None for key in (self.prv, self.sig_prv, self.pq_prv, self.pq_sig_prv))
+        return False
 
     def has_public_key(self):
         if self.crypto_mode == Identity.CRYPTO_LEGACY:
             return self.pub is not None and self.sig_pub is not None
         if self.crypto_mode == Identity.CRYPTO_PQ:
             return self.pq_pub is not None and self.pq_sig_pub is not None
-        return all(key is not None for key in (self.pub, self.sig_pub, self.pq_pub, self.pq_sig_pub))
-    def _public_public_bundle(self):
-        return {"classical": self.pub_bytes, "classical_sig": self.sig_pub_bytes,
-                "pq": self.pq_pub_bytes, "pq_sig": self.pq_sig_pub_bytes}
-
-    def _public_private_bundle(self):
-        return {"classical": self.prv_bytes, "classical_sig": self.sig_prv_bytes,
-                "pq": self.pq_prv_bytes, "pq_sig": self.pq_sig_prv_bytes}
+        return False
 
     def _load_tagged_bundle(self, payload, private):
         Identity._validate_bundle_fields(payload, private=private)
-        mode = payload["mode"]
         public_key = payload["public_key"]
         secret = payload.get("private_key") if private else None
-        self.crypto_mode = mode
+        self.crypto_mode = Identity.CRYPTO_PQ
         self.pub_bytes = public_key["classical"]
         self.sig_pub_bytes = public_key["classical_sig"]
         self.pq_pub_bytes = public_key["pq"]
         self.pq_sig_pub_bytes = public_key["pq_sig"]
-        self.pub = X25519PublicKey.from_public_bytes(self.pub_bytes) if self.pub_bytes else None
-        self.sig_pub = Ed25519PublicKey.from_public_bytes(self.sig_pub_bytes) if self.sig_pub_bytes else None
+        self.pub = None
+        self.sig_pub = None
         self.pq_pub = MLKEMPublicKey.from_public_bytes(self.pq_pub_bytes)
         self.pq_sig_pub = MLDSAPublicKey.from_public_bytes(self.pq_sig_pub_bytes)
         if private:
@@ -1027,15 +971,14 @@ class Identity:
             self.sig_prv_bytes = secret["classical_sig"]
             self.pq_prv_bytes = secret["pq"]
             self.pq_sig_prv_bytes = secret["pq_sig"]
-            self.prv = X25519PrivateKey.from_private_bytes(self.prv_bytes) if self.prv_bytes else None
-            self.sig_prv = Ed25519PrivateKey.from_private_bytes(self.sig_prv_bytes) if self.sig_prv_bytes else None
+            self.prv = None
+            self.sig_prv = None
             self.pq_prv = MLKEMPrivateKey.from_private_bytes(self.pq_prv_bytes, public_bytes=self.pq_pub_bytes)
             self.pq_sig_prv = MLDSAPrivateKey.from_private_bytes(self.pq_sig_prv_bytes, public_bytes=self.pq_sig_pub_bytes)
         else:
             self.prv = self.prv_bytes = self.sig_prv = self.sig_prv_bytes = None
             self.pq_prv = self.pq_prv_bytes = self.pq_sig_prv = self.pq_sig_prv_bytes = None
         self.update_hashes()
-
     def _commit_key_state(self, source):
         for name in ("crypto_mode", "prv", "prv_bytes", "sig_prv", "sig_prv_bytes",
                      "pq_prv", "pq_prv_bytes", "pq_sig_prv", "pq_sig_prv_bytes",
@@ -1108,23 +1051,6 @@ class Identity:
                 candidate.update_hashes()
                 self._commit_key_state(candidate)
                 return True
-            if len(pub_bytes) == Identity._public_key_size(Identity.CRYPTO_HYBRID):
-                candidate = Identity(create_keys=False)
-                candidate.crypto_mode = Identity.CRYPTO_HYBRID
-                legacy = Identity._legacy_public_size()
-                candidate.pub_bytes = pub_bytes[:legacy//2]
-                candidate.sig_pub_bytes = pub_bytes[legacy//2:legacy]
-                offset = legacy
-                candidate.pq_pub_bytes = pub_bytes[offset:offset+Identity.PQ_KEM_PUBLIC_SIZE]
-                offset += Identity.PQ_KEM_PUBLIC_SIZE
-                candidate.pq_sig_pub_bytes = pub_bytes[offset:]
-                candidate.pub = X25519PublicKey.from_public_bytes(candidate.pub_bytes)
-                candidate.sig_pub = Ed25519PublicKey.from_public_bytes(candidate.sig_pub_bytes)
-                candidate.pq_pub = MLKEMPublicKey.from_public_bytes(candidate.pq_pub_bytes)
-                candidate.pq_sig_pub = MLDSAPublicKey.from_public_bytes(candidate.pq_sig_pub_bytes)
-                candidate.update_hashes()
-                self._commit_key_state(candidate)
-                return True
             return False
         except Exception as e:
             RNS.log(f"Error while loading public key, the contained exception was: {e}", RNS.LOG_ERROR)
@@ -1171,26 +1097,8 @@ class Identity:
                 ciphertext = token.encrypt(plaintext)
                 return pq_ciphertext + ciphertext
 
-            if self.crypto_mode == Identity.CRYPTO_HYBRID:
-                if self.pub == None or self.pq_pub == None:
-                    raise KeyError("Encryption failed because identity does not hold a public key")
-                ephemeral_key = X25519PrivateKey.generate()
-                ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes()
-                if ratchet != None:
-                    target_public_key = X25519PublicKey.from_public_bytes(ratchet)
-                else:
-                    target_public_key = self.pub
-                classical_shared = ephemeral_key.exchange(target_public_key)
-                pq_ciphertext, pq_shared = self.pq_pub.encapsulate()
-                shared_key = classical_shared + pq_shared
-                derived_key = RNS.Cryptography.hkdf(length=Identity.DERIVED_KEY_LENGTH,
-                                                   derive_from=shared_key,
-                                                   salt=self.get_salt(),
-                                                   context=self.get_context())
-                token = Token(derived_key)
-                ciphertext = token.encrypt(plaintext)
-                return ephemeral_pub_bytes + pq_ciphertext + ciphertext
-
+            if self.crypto_mode != Identity.CRYPTO_LEGACY:
+                raise ValueError("Unknown identity crypto mode")
             if self.pub != None:
                 ephemeral_key = X25519PrivateKey.generate()
                 ephemeral_pub_bytes = ephemeral_key.public_key().public_bytes()
@@ -1250,19 +1158,8 @@ class Identity:
                 shared_key = self.pq_prv.decapsulate(pq_ciphertext)
                 return self.__decrypt(shared_key, ciphertext)
 
-            if self.crypto_mode == Identity.CRYPTO_HYBRID:
-                classical_len = Identity._legacy_public_size()//2
-                if self.prv == None or self.pq_prv == None or len(ciphertext_token) <= classical_len + Identity.PQ_KEM_CIPHERTEXT_SIZE:
-                    RNS.log("Decryption failed because the token size was invalid.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
-                    return None
-                peer_pub_bytes = ciphertext_token[:classical_len]
-                peer_pub = X25519PublicKey.from_public_bytes(peer_pub_bytes)
-                pq_ciphertext = ciphertext_token[classical_len:classical_len+Identity.PQ_KEM_CIPHERTEXT_SIZE]
-                ciphertext = ciphertext_token[classical_len+Identity.PQ_KEM_CIPHERTEXT_SIZE:]
-                classical_shared = self.prv.exchange(peer_pub)
-                pq_shared = self.pq_prv.decapsulate(pq_ciphertext)
-                return self.__decrypt(classical_shared + pq_shared, ciphertext)
-
+            if self.crypto_mode != Identity.CRYPTO_LEGACY:
+                return None
             if self.prv != None:
                 if len(ciphertext_token) > Identity.KEYSIZE//8//2:
                     plaintext = None
@@ -1280,10 +1177,8 @@ class Identity:
                                     plaintext = self.__decrypt(shared_key, ciphertext)
                                     if ratchet_id_receiver:
                                         ratchet_id_receiver.latest_ratchet_id = ratchet_id
-                                    
                                     break
-                                
-                                except Exception as e:
+                                except Exception:
                                     pass
 
                         if enforce_ratchets and plaintext == None:
@@ -1303,9 +1198,8 @@ class Identity:
                         RNS.log("Decryption by "+RNS.prettyhexrep(self.hash)+" failed: "+str(e), RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                         if ratchet_id_receiver:
                             ratchet_id_receiver.latest_ratchet_id = None
-                        
+
                     return plaintext
-                
                 else:
                     RNS.log("Decryption failed because the token size was invalid.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                     return None
@@ -1322,8 +1216,6 @@ class Identity:
         try:
             if self.crypto_mode == Identity.CRYPTO_PQ and self.pq_sig_prv is not None:
                 return self.pq_sig_prv.sign(message)
-            if self.crypto_mode == Identity.CRYPTO_HYBRID and self.sig_prv is not None and self.pq_sig_prv is not None:
-                return self.sig_prv.sign(message) + self.pq_sig_prv.sign(message)
             if self.crypto_mode == Identity.CRYPTO_LEGACY and self.sig_prv is not None:
                 return self.sig_prv.sign(message)
             raise KeyError("Signing failed because identity does not hold a private key")
@@ -1340,15 +1232,8 @@ class Identity:
                 return self.pq_sig_pub.verify(signature, message)
             except Exception:
                 return False
-        if self.crypto_mode == Identity.CRYPTO_HYBRID:
-            try:
-                parts = Identity.split_signature(self.crypto_mode, signature)
-                if not self.sig_pub or not self.pq_sig_pub:
-                    return False
-                self.sig_pub.verify(parts["classical"], message)
-                return bool(self.pq_sig_pub.verify(parts["pq"], message))
-            except Exception:
-                return False
+        if self.crypto_mode != Identity.CRYPTO_LEGACY:
+            return False
         if self.sig_pub is None:
             raise KeyError("Signature validation failed because identity does not hold a public key")
         try:

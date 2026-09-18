@@ -219,12 +219,13 @@ class PQAnnounceTransfer:
     def __init__(self, destination, announce_data, context, context_flag=0,
                  attached_interface=None, header_type=0, ifac_size=0):
         import RNS
+        if destination.identity is None or destination.identity.crypto_mode != RNS.Identity.CRYPTO_PQ:
+            raise ValueError("PQ announces require a PQ identity")
         self.destination = destination
         self.announce_data = bytes(announce_data)
         self.context = context
         self.context_flag = context_flag
-        mode_flags = 1 if destination.identity.crypto_mode == RNS.Identity.CRYPTO_PQ else 2
-        fragment_flags = (mode_flags << 5) | ((context & 0x0F) << 1) | (context_flag & 0x01)
+        fragment_flags = (1 << 5) | ((context & 0x0F) << 1) | (context_flag & 0x01)
         self.fragments = fragment_record(RECORD_ANNOUNCE, self.announce_data,
                                           flags=fragment_flags, header_type=header_type,
                                           ifac_size=ifac_size)
@@ -291,26 +292,17 @@ class PQSessionManager:
         import os
         import RNS
         identity = destination.identity
-        if identity is None or identity.crypto_mode == RNS.Identity.CRYPTO_LEGACY:
-            raise ValueError("PQ session requires a PQ or hybrid destination")
+        if identity is None or identity.crypto_mode != RNS.Identity.CRYPTO_PQ:
+            raise ValueError("PQ session requires a PQ destination")
         session_id = os.urandom(8)
         nonce = os.urandom(16)
         logical_payload = bytes(logical_payload)
         logical_hash = RNS.Identity.full_hash(logical_payload)
-        ephemeral = b""
-        shared_parts = []
-        if identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID:
-            from RNS.Cryptography import X25519PrivateKey
-            ephemeral_key = X25519PrivateKey.generate()
-            ephemeral = ephemeral_key.public_key().public_bytes()
-            shared_parts.append(ephemeral_key.exchange(identity.pub))
         ciphertext, pq_shared = identity.pq_pub.encapsulate()
-        shared_parts.append(pq_shared)
-        mode_byte = 1 if identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID else 0
-        request = self.REQUEST_HEADER.pack(self.SESSION_VERSION, mode_byte, session_id, nonce, logical_hash)
-        request += ephemeral + ciphertext
+        request = self.REQUEST_HEADER.pack(self.SESSION_VERSION, 0, session_id, nonce, logical_hash)
+        request += ciphertext
         transcript = hashlib.sha256(request).digest()
-        key = self._derive(b"".join(shared_parts), destination.hash, session_id, transcript)
+        key = self._derive(pq_shared, destination.hash, session_id, transcript)
         with self._lock:
             self._prune()
             if len(self.sessions) >= self.max_sessions:
@@ -326,24 +318,19 @@ class PQSessionManager:
     def accept_request(self, identity, destination_hash, request):
         import RNS
         request = bytes(request)
+        if identity is None or identity.crypto_mode != RNS.Identity.CRYPTO_PQ:
+            raise ValueError("PQ session requires a PQ identity")
         if len(request) < self.REQUEST_HEADER.size:
             raise ValueError("truncated PQ session request")
         version, mode_byte, session_id, nonce, logical_hash = self.REQUEST_HEADER.unpack_from(request)
-        if version != self.SESSION_VERSION or mode_byte not in (0, 1):
+        if version != self.SESSION_VERSION or mode_byte != 0:
             raise ValueError("unsupported PQ session request")
         offset = self.REQUEST_HEADER.size
-        shared_parts = []
-        if mode_byte:
-            if identity.crypto_mode != RNS.Identity.CRYPTO_HYBRID or len(request) < offset + 32:
-                raise ValueError("invalid hybrid PQ session request")
-            from RNS.Cryptography import X25519PublicKey
-            shared_parts.append(identity.prv.exchange(X25519PublicKey.from_public_bytes(request[offset:offset+32])))
-            offset += 32
         if identity.pq_prv is None or len(request) != offset + RNS.Identity.PQ_KEM_CIPHERTEXT_SIZE:
             raise ValueError("invalid PQ session ciphertext")
-        shared_parts.append(identity.pq_prv.decapsulate(request[offset:]))
+        pq_shared = identity.pq_prv.decapsulate(request[offset:])
         transcript = hashlib.sha256(request).digest()
-        key = self._derive(b"".join(shared_parts), destination_hash, session_id, transcript)
+        key = self._derive(pq_shared, destination_hash, session_id, transcript)
         with self._lock:
             self._prune()
             if len(self.sessions) >= self.max_sessions:
@@ -382,6 +369,33 @@ class PQSessionManager:
             payload = state["logical_payload"]
         data = self.encrypt_data(destination_hash, session_id, payload)
         return fragment_record(RECORD_SESSION_DATA, data)
+    def proof_fragments_after_data(self, destination_hash, session_id):
+        with self._lock:
+            state = self.sessions.get((destination_hash, bytes(session_id)))
+            if state is None or not state["established"] or not state["data_received"]:
+                return []
+            logical_hash = state["logical_hash"]
+            proof = (bytes(session_id) + logical_hash +
+                     hmac.new(state["key"], b"PROOF" + logical_hash,
+                              hashlib.sha256).digest())
+        return fragment_record(RECORD_PROOF, proof)
+
+    def validate_proof(self, destination_hash, proof):
+        proof = bytes(proof)
+        if len(proof) != 8 + 32 + 32:
+            return False
+        session_id = proof[:8]
+        logical_hash = proof[8:40]
+        mac = proof[40:]
+        with self._lock:
+            state = self.sessions.get((destination_hash, session_id))
+            if (state is None or not state["data_sent"] or
+                    state["logical_hash"] != logical_hash):
+                return False
+            state["updated"] = time.monotonic()
+            return hmac.compare_digest(
+                mac, hmac.new(state["key"], b"PROOF" + logical_hash,
+                              hashlib.sha256).digest())
 
     def encrypt_data(self, destination_hash, session_id, plaintext):
         with self._lock:

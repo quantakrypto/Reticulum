@@ -203,12 +203,18 @@ def _valid_identity_bytes(data, private=False):
     if not isinstance(data, bytes):
         return False
     if data.startswith(RNS.Identity.KEY_FORMAT_MAGIC):
-        return True
+        try:
+            payload = RNS.Identity._deserialize_key_bundle(data)
+            if payload is None:
+                return False
+            RNS.Identity._validate_bundle_fields(payload, private=private)
+            return True
+        except Exception:
+            return False
     expected = RNS.Identity._legacy_private_size() if private else RNS.Identity._legacy_public_size()
     if len(data) == expected:
         return True
-    if not private and len(data) in (RNS.Identity._public_key_size(RNS.Identity.CRYPTO_PQ),
-                                     RNS.Identity._public_key_size(RNS.Identity.CRYPTO_HYBRID)):
+    if not private and len(data) == RNS.Identity._public_key_size(RNS.Identity.CRYPTO_PQ):
         return True
     return False
 
@@ -237,7 +243,7 @@ def get_operating_identity(args, allow_none=False, no_cache=False):
             try:
                 identity = RNS.Identity.from_file(load_path)
                 print(f"Loaded Identity {identity} from {load_path}")
-                if not identity.get_private_key() or not identity.get_public_key():
+                if identity is None or not identity.get_private_key() or not identity.get_public_key():
                     raise SystemError("Missing key data in loaded identity")
 
             except Exception as e: print(f"Could not load Identity from specified file: {e}"); exit(R_INVALID_IDENTITY)
@@ -354,14 +360,20 @@ def get_operating_identity(args, allow_none=False, no_cache=False):
                 exit(R_INVALID_IDENTITY)
 
         if args.import_prv:
-            try: identity = RNS.Identity.from_bytes(identity_bytes)
-            except Exception as e: print("Could not create Reticulum identity from specified data: "+str(e)); exit(R_INVALID_IDENTITY)
+            try:
+                identity = RNS.Identity.from_bytes(identity_bytes)
+                if identity is None:
+                    raise SystemError("Invalid private identity")
+            except Exception as e:
+                print("Could not create Reticulum identity from specified data: "+str(e)); exit(R_INVALID_IDENTITY)
 
         elif args.import_pub:
             try:
                 identity = RNS.Identity(create_keys=False)
-                identity.load_public_key(identity_bytes)
-            except Exception as e: print("Could not create Reticulum identity from specified data: "+str(e)); exit(R_INVALID_IDENTITY)
+                if not identity.load_public_key(identity_bytes):
+                    raise SystemError("Invalid public identity")
+            except Exception as e:
+                print("Could not create Reticulum identity from specified data: "+str(e)); exit(R_INVALID_IDENTITY)
 
     return identity
 
@@ -413,7 +425,6 @@ def _parse_rsg_signature(rsg_data):
     candidate_offsets = {
         RNS.Identity._legacy_signature_size(),
         RNS.Identity.PQ_SIG_SIGNATURE_SIZE,
-        RNS.Identity._legacy_signature_size() + RNS.Identity.PQ_SIG_SIGNATURE_SIZE,
     }
     for offset in sorted(candidate_offsets):
         if len(rsg_data) <= offset:

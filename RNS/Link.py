@@ -112,6 +112,7 @@ class Link:
     ACTIVE              = 0x02
     STALE               = 0x03
     CLOSED              = 0x04
+    TIMEOUT             = 0x01
     INITIATOR_CLOSED    = 0x02
     DESTINATION_CLOSED  = 0x03
 
@@ -346,30 +347,36 @@ class Link:
 
     def handshake(self):
         if self.status == Link.PENDING and self.prv != None:
-            self.status = Link.HANDSHAKE
-            self.shared_key = self.prv.exchange(self.peer_pub)
+            mode = (self.destination.identity.crypto_mode if self.destination is not None
+                    else self.owner.identity.crypto_mode)
+            if mode == RNS.Identity.CRYPTO_LEGACY:
+                self.status = Link.HANDSHAKE
+                self.shared_key = self.prv.exchange(self.peer_pub)
 
-            if   self.mode == Link.MODE_AES128_CBC: derived_key_length = 32
-            elif self.mode == Link.MODE_AES256_CBC: derived_key_length = 64
-            else: raise TypeError(f"Invalid link mode {self.mode} on {self}")
+                if   self.mode == Link.MODE_AES128_CBC: derived_key_length = 32
+                elif self.mode == Link.MODE_AES256_CBC: derived_key_length = 64
+                else: raise TypeError(f"Invalid link mode {self.mode} on {self}")
 
-            self.derived_key = RNS.Cryptography.hkdf(
-                length=derived_key_length,
-                derive_from=self.shared_key,
-                salt=self.get_salt(),
-                context=self.get_context())
-            if self.destination is not None and self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+                self.derived_key = RNS.Cryptography.hkdf(
+                    length=derived_key_length,
+                    derive_from=self.shared_key,
+                    salt=self.get_salt(),
+                    context=self.get_context())
+            elif mode == RNS.Identity.CRYPTO_PQ:
+                self.shared_key = None
+                self.derived_key = None
                 self.status = Link.PQ_HANDSHAKE
+            else:
+                raise ValueError("Unknown identity crypto mode")
         else: RNS.log("Handshake attempt on "+str(self)+" with invalid state "+str(self.status), RNS.LOG_ERROR)
     def _pq_derive_key(self, pq_shared, transcript):
         import hashlib
-        mode = self.destination.identity.crypto_mode if self.destination is not None else self.owner.identity.crypto_mode
         length = 64 if self.mode == Link.MODE_AES256_CBC else 32
         return RNS.Cryptography.hkdf(
             length=length,
-            derive_from=self.shared_key + pq_shared,
+            derive_from=pq_shared,
             salt=self.link_id,
-            context=b"RNS-PQ-LINK"+bytes([mode == RNS.Identity.CRYPTO_HYBRID])+hashlib.sha256(transcript).digest())
+            context=b"RNS-PQ-LINK"+b"\x00"+hashlib.sha256(transcript).digest())
 
     def _activate_pq(self, final_key, transcript):
         import time
@@ -379,9 +386,15 @@ class Link:
         self.status = Link.ACTIVE
         self.activated_at = time.time()
         self.last_proof = self.activated_at
-        RNS.Transport.activate_link(self)
-        if self.callbacks.link_established is not None:
-            thread = threading.Thread(target=self.callbacks.link_established, args=(self,))
+        if self.rtt is None:
+            self.rtt = max(self.activated_at - self.request_time, 0.001)
+        if self.initiator:
+            RNS.Transport.activate_link(self)
+            callback = self.callbacks.link_established
+        else:
+            callback = self.owner.callbacks.link_established
+        if callback is not None:
+            thread = threading.Thread(target=callback, args=(self,))
             thread.daemon = True
             thread.start()
 
@@ -389,16 +402,17 @@ class Link:
         import hashlib
         if not self.initiator or self.destination is None or self.pq_confirmed:
             return False
+        if self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_PQ:
+            raise ValueError("PQ handshake requires a PQ destination")
         from RNS.PQ import RECORD_LINK, fragment_record
         ciphertext, pq_shared = self.destination.identity.pq_pub.encapsulate()
-        mode = self.destination.identity.crypto_mode
         transcript = (self.link_id + self.pub_bytes + self.peer_pub_bytes +
-                      ciphertext + bytes([mode == RNS.Identity.CRYPTO_HYBRID]))
+                      ciphertext + b"\x00")
         transcript_hash = hashlib.sha256(transcript).digest()
         self.pq_transcript = transcript_hash
-        self.pq_pending_key = self._pq_derive_key(pq_shared, transcript_hash)
+        self.pq_pending_key = self._pq_derive_key(pq_shared, transcript)
         payload = umsgpack.packb({"type": "pq_request", "link_id": self.link_id,
-                                  "mode": mode, "kem": ciphertext,
+                                  "mode": "pq", "kem": ciphertext,
                                   "transcript": transcript_hash})
         for fragment in fragment_record(RECORD_LINK, payload):
             packet = RNS.Packet(self, fragment.pack(), RNS.Packet.DATA,
@@ -410,23 +424,25 @@ class Link:
         import hashlib
         import hmac
         from RNS.PQ import RECORD_LINK, fragment_record
-        if self.destination is None or self.owner.identity.pq_prv is None:
+        if (self.owner.identity.crypto_mode != RNS.Identity.CRYPTO_PQ or
+                self.owner.identity.pq_prv is None):
             return False
         request = umsgpack.unpackb(payload)
         if not isinstance(request, dict) or request.get("type") != "pq_request":
             return False
-        if request.get("link_id") != self.link_id or request.get("mode") != self.owner.identity.crypto_mode:
+        if request.get("link_id") != self.link_id or request.get("mode") != "pq":
             return False
         kem = request.get("kem")
         transcript = request.get("transcript")
         if not isinstance(kem, bytes) or not isinstance(transcript, bytes):
             return False
-        expected = hashlib.sha256(self.link_id + self.peer_pub_bytes + self.pub_bytes +
-                                  kem + bytes([self.owner.identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID])).digest()
+        transcript_data = (self.link_id + self.peer_pub_bytes + self.pub_bytes +
+                           kem + b"\x00")
+        expected = hashlib.sha256(transcript_data).digest()
         if not hmac.compare_digest(expected, transcript):
             return False
         pq_shared = self.owner.identity.pq_prv.decapsulate(kem)
-        final_key = self._pq_derive_key(pq_shared, transcript)
+        final_key = self._pq_derive_key(pq_shared, transcript_data)
         confirmation = umsgpack.packb({
             "type": "pq_confirm", "link_id": self.link_id,
             "transcript": transcript,
@@ -436,20 +452,17 @@ class Link:
             packet = RNS.Packet(self, fragment.pack(), RNS.Packet.PROOF,
                                 context=RNS.Packet.PQ_FRAGMENT)
             packet.send()
-        self._pq_activate(final_key, transcript)
+        self._activate_pq(final_key, transcript)
         return True
-
-
-
     def prove(self):
         signalling_bytes = Link.signalling_bytes(self.mtu, self.mode)
         mode = self.owner.identity.crypto_mode
         if mode == RNS.Identity.CRYPTO_PQ:
             sig_public = self.owner.identity.pq_sig_pub_bytes
-        elif mode == RNS.Identity.CRYPTO_HYBRID:
-            sig_public = self.owner.identity.sig_pub_bytes + self.owner.identity.pq_sig_pub_bytes
-        else:
+        elif mode == RNS.Identity.CRYPTO_LEGACY:
             sig_public = self.sig_pub_bytes
+        else:
+            raise ValueError("Unknown identity crypto mode")
         signed_data = self.link_id + self.pub_bytes + sig_public + signalling_bytes
         signature = self.owner.identity.sign(signed_data)
         if mode == RNS.Identity.CRYPTO_LEGACY:
@@ -470,14 +483,17 @@ class Link:
 
     def prove_packet(self, packet):
         import hmac
-        pq_link = ((self.__remote_identity is not None and
-                    self.__remote_identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY) or
-                   (self.destination is not None and self.destination.identity is not None and
-                    self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY))
-        if pq_link:
+        modes = []
+        if self.__remote_identity is not None:
+            modes.append(self.__remote_identity.crypto_mode)
+        if self.destination is not None and self.destination.identity is not None:
+            modes.append(self.destination.identity.crypto_mode)
+        if RNS.Identity.CRYPTO_PQ in modes:
             proof_data = packet.packet_hash + hmac.new(self.derived_key, packet.packet_hash, "sha256").digest()
-        else:
+        elif modes and all(mode == RNS.Identity.CRYPTO_LEGACY for mode in modes):
             proof_data = packet.packet_hash + self.sign(packet.packet_hash)
+        else:
+            raise ValueError("Unknown identity crypto mode")
         proof = RNS.Packet(self, proof_data, RNS.Packet.PROOF)
         proof.send()
         self.had_outbound()
@@ -507,15 +523,12 @@ class Link:
                                      hashlib.sha256).digest()
                 if not isinstance(mac, bytes) or not hmac.compare_digest(mac, expected):
                     return False
-                self._pq_activate(self.pq_pending_key, transcript)
+                self._activate_pq(self.pq_pending_key, transcript)
                 return True
             identity = self.destination.identity
-            if identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
-                sig_public = identity.pq_sig_pub_bytes
-            elif identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID:
-                sig_public = identity.sig_pub_bytes + identity.pq_sig_pub_bytes
-            else:
+            if identity.crypto_mode != RNS.Identity.CRYPTO_PQ:
                 return False
+            sig_public = identity.pq_sig_pub_bytes
             if proof.get("sig_pub") != sig_public:
                 return False
             peer_pub_bytes = proof["pub"]
@@ -535,8 +548,10 @@ class Link:
             self.__remote_identity = identity
             self.mtu = RNS.Reticulum.MTU
             self.update_mdu()
-            if identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+            if identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
                 return self._start_pq_handshake()
+            if identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+                return False
             self.status = Link.ACTIVE
             self.activated_at = time.time()
             self.last_proof = self.activated_at
@@ -558,13 +573,13 @@ class Link:
                 signalling_bytes = b""
                 confirmed_mtu = None
                 mode = Link.mode_from_lp_packet(packet)
-                proof_sig_lens = [RNS.Identity._signature_size(self.destination.identity.crypto_mode)]
-                if self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID:
-                    proof_sig_lens = [RNS.Identity._legacy_signature_size(), RNS.Identity.PQ_SIG_SIGNATURE_SIZE, RNS.Identity._legacy_signature_size()+RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
-                elif self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
+                identity_mode = self.destination.identity.crypto_mode
+                if identity_mode == RNS.Identity.CRYPTO_PQ:
                     proof_sig_lens = [RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
-                else:
+                elif identity_mode == RNS.Identity.CRYPTO_LEGACY:
                     proof_sig_lens = [RNS.Identity._legacy_signature_size()]
+                else:
+                    return False
                 RNS.log(f"Validating link request proof with mode {Link.MODE_DESCRIPTIONS[mode]}", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
                 if mode != self.mode: raise TypeError(f"Invalid link mode {mode} in link request proof")
                 matched_sig_len = None
@@ -849,7 +864,8 @@ class Link:
         be used if a new link to the same destination is established.
         """
         if self.status == Link.CLOSED: return
-        if self.status != Link.PENDING and self.status != Link.CLOSED: self.__teardown_packet()
+        if self.status in (Link.ACTIVE, Link.STALE) and self.derived_key is not None:
+            self.__teardown_packet()
         self.status = Link.CLOSED
         if self.initiator: self.teardown_reason = Link.INITIATOR_CLOSED
         else: self.teardown_reason = Link.DESTINATION_CLOSED
@@ -913,7 +929,7 @@ class Link:
                         self.link_closed()
                         sleep_time = 0.001
 
-                elif self.status == Link.HANDSHAKE:
+                elif self.status in (Link.HANDSHAKE, Link.PQ_HANDSHAKE):
                     next_check = self.request_time + self.establishment_timeout
                     sleep_time = next_check - time.time()
                     if time.time() >= self.request_time + self.establishment_timeout:
@@ -1134,8 +1150,7 @@ class Link:
                     if packet.context == RNS.Packet.PQ_FRAGMENT:
                         try:
                             from RNS.PQ import PQFragment, RECORD_LINK
-                            plaintext = self.decrypt(packet.data)
-                            fragment = PQFragment.unpack(plaintext)
+                            fragment = PQFragment.unpack(packet.data)
                             if fragment.record_kind == RECORD_LINK:
                                 if self.pq_link_assembler is None:
                                     from RNS.PQ import FragmentAssembler
@@ -1180,9 +1195,8 @@ class Link:
                                         plaintext = self.pq_identify_assembler.add(fragment)
                             except Exception:
                                 plaintext = None
-                        if plaintext != None:
                             identity = None
-                            for mode in (RNS.Identity.CRYPTO_HYBRID, RNS.Identity.CRYPTO_PQ, RNS.Identity.CRYPTO_LEGACY):
+                            for mode in (RNS.Identity.CRYPTO_PQ, RNS.Identity.CRYPTO_LEGACY):
                                 public_size = RNS.Identity._public_key_size(mode)
                                 signature_size = RNS.Identity._signature_size(mode)
                                 if len(plaintext) != public_size + signature_size:

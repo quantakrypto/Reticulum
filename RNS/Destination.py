@@ -242,7 +242,7 @@ class Destination:
         return False
 
     def announce(self, app_data=None, path_response=False, attached_interface=None, tag=None, send=True):
-        """Announce this destination, fragmenting only PQ/hybrid records."""
+        """Announce this destination, fragmenting PQ records."""
         now = time.time()
         stale_responses = [entry_tag for entry_tag, entry in self.path_responses.items()
                            if now > entry[0] + Destination.PR_TAG_WINDOW]
@@ -279,7 +279,7 @@ class Destination:
                 self.path_responses[tag] = [time.time(), announce_data, cached_context_flag]
 
         announce_context = RNS.Packet.PATH_RESPONSE if path_response else RNS.Packet.NONE
-        if self.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+        if self.identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
             from RNS.PQ import PQAnnounceTransfer
             transfer = PQAnnounceTransfer(self, announce_data, announce_context,
                                           context_flag=cached_context_flag,
@@ -288,6 +288,8 @@ class Destination:
                 transfer.send()
                 return transfer
             return transfer
+        if self.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+            raise ValueError("Unknown identity crypto mode")
 
         announce_packet = RNS.Packet(self, announce_data, RNS.Packet.ANNOUNCE,
                                      context=announce_context, attached_interface=attached_interface,

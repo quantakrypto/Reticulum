@@ -114,6 +114,7 @@ class Transport:
     TC_INGRESS_LIMITED          = 0x03
 
     APP_NAME = "rnstransport"
+    PQ_TUNNEL_MAGIC            = b"RNSPQT1"
 
     PATHFINDER_M                = 128          # Max hops
     """
@@ -322,22 +323,30 @@ class Transport:
 
     @staticmethod
     def _handle_pq_session_fragment(packet):
-        from RNS.PQ import (PQFragment, RECORD_SESSION_ACK,
-                            RECORD_SESSION_DATA, RECORD_SESSION_REQUEST)
+        from RNS.PQ import (PQFragment, RECORD_PROOF, RECORD_TUNNEL,
+                            RECORD_SESSION_ACK, RECORD_SESSION_DATA,
+                            RECORD_SESSION_REQUEST, fragment_record)
         try:
             fragment = PQFragment.unpack(packet.data)
         except (TypeError, ValueError):
             return False
+        if fragment.record_kind == RECORD_TUNNEL:
+            try:
+                assembled = Transport._pq_assembler().add(fragment)
+                if assembled is not None:
+                    Transport.tunnel_synthesize_handler(assembled, packet)
+                return True
+            except (MemoryError, TypeError, ValueError):
+                return True
         if fragment.record_kind not in (
-                RECORD_SESSION_REQUEST, RECORD_SESSION_ACK, RECORD_SESSION_DATA):
+                RECORD_SESSION_REQUEST, RECORD_SESSION_ACK, RECORD_SESSION_DATA,
+                RECORD_PROOF):
             return False
-        from RNS.PQ import PQSessionManager, fragment_record, RECORD_SESSION_ACK
+
+        from RNS.PQ import PQSessionManager
         if Transport.pq_session_manager is None:
             Transport.pq_session_manager = PQSessionManager()
         manager = Transport.pq_session_manager
-        assembled = Transport._pq_session_assembler().add(fragment)
-        if assembled is None:
-            return True
 
         destination = None
         with Transport.destinations_map_lock:
@@ -346,17 +355,25 @@ class Transport:
                 destination = candidate
 
         session_destination_hash = packet.destination_hash
-        if fragment.record_kind in (RECORD_SESSION_ACK, RECORD_SESSION_DATA):
-            session_id = assembled[1:9]
-            if destination is None:
+        if fragment.record_kind == RECORD_SESSION_REQUEST and destination is None:
+            return False
+        if fragment.record_kind != RECORD_SESSION_REQUEST:
+            session_offset = 1 if fragment.record_kind == RECORD_SESSION_ACK else 0
+            session_id = fragment.payload[session_offset:session_offset+8]
+            if destination is None and len(session_id) == 8:
                 session_destination_hash, destination = manager.destination_for_session(session_id)
             if destination is None:
-                return True
+                return False
+
+        assembled = Transport._pq_session_assembler().add(fragment)
+        if assembled is None:
+            return True
 
         if fragment.record_kind == RECORD_SESSION_REQUEST:
-            if destination is None or destination.identity is None:
-                return True
-            if destination.identity.crypto_mode == RNS.Identity.CRYPTO_LEGACY:
+            if destination is None:
+                return False
+            if (destination.identity is None or
+                    destination.identity.crypto_mode != RNS.Identity.CRYPTO_PQ):
                 return True
             try:
                 ack, session_id = manager.accept_request(
@@ -375,9 +392,9 @@ class Transport:
 
         if fragment.record_kind == RECORD_SESSION_ACK:
             try:
-                if manager.validate_ack(session_destination_hash, session_id, assembled):
+                if manager.validate_ack(session_destination_hash, assembled[1:9], assembled):
                     for data_fragment in manager.data_fragments_after_ack(
-                            session_destination_hash, session_id):
+                            session_destination_hash, assembled[1:9]):
                         control = RNS.Packet.from_fragment(
                             destination, data_fragment.pack(),
                             packet_type=RNS.Packet.DATA,
@@ -387,17 +404,44 @@ class Transport:
                 pass
             return True
 
-        plaintext = manager.decrypt_data(session_destination_hash, assembled)
-        if plaintext is None or destination is None:
+        if fragment.record_kind == RECORD_SESSION_DATA:
+            plaintext = manager.decrypt_data(session_destination_hash, assembled)
+            if plaintext is None or destination is None:
+                return True
+            packet.context = RNS.Packet.NONE
+            packet.destination = destination
+            packet.pq_session_proof = (session_destination_hash, assembled[:8])
+            packet.data = plaintext
+            if destination.callbacks.packet is not None:
+                try:
+                    destination.callbacks.packet(plaintext, packet)
+                except Exception as e:
+                    RNS.log("Error while executing PQ session receive callback: "+str(e),
+                            RNS.LOG_ERROR)
+            for proof_fragment in manager.proof_fragments_after_data(
+                    session_destination_hash, assembled[:8]):
+                response = RNS.Packet(
+                    packet.generate_proof_destination(), proof_fragment.pack(),
+                    packet_type=RNS.Packet.PROOF,
+                    context=RNS.Packet.PQ_FRAGMENT,
+                    attached_interface=packet.receiving_interface)
+                response.send()
             return True
-        packet.context = RNS.Packet.NONE
-        packet.data = plaintext
-        if destination.callbacks.packet is not None:
-            try:
-                destination.callbacks.packet(plaintext, packet)
-            except Exception as e:
-                RNS.log("Error while executing PQ session receive callback: "+str(e),
-                        RNS.LOG_ERROR)
+
+        if manager.validate_proof(session_destination_hash, assembled):
+            logical_hash = assembled[8:40]
+            with Transport.receipts_lock:
+                candidate_receipts = [
+                    receipt for receipt in Transport.receipts
+                    if receipt.status == RNS.PacketReceipt.SENT
+                    and receipt.hash == logical_hash
+                ]
+            for receipt in candidate_receipts:
+                if receipt.validate_pq_proof(assembled, packet):
+                    with Transport.receipts_lock:
+                        if receipt in Transport.receipts:
+                            Transport.receipts.remove(receipt)
+                    break
         return True
 
     @staticmethod
@@ -407,6 +451,9 @@ class Transport:
         if fragment.record_kind != RECORD_ANNOUNCE:
             return packet
         assembler = Transport._pq_assembler()
+        mode_flags = (fragment.flags >> 5) & 0x03
+        if mode_flags != 1:
+            raise ValueError("unsupported PQ announce identity mode")
         assembled = assembler.add(fragment)
         if assembled is None:
             return None
@@ -420,11 +467,7 @@ class Transport:
         logical.transport_id = packet.transport_id
         logical.context = (fragment.flags >> 1) & 0x0F
         logical.context_flag = fragment.flags & 0x01
-        mode_flags = (fragment.flags >> 5) & 0x03
-        logical.announce_mode = {
-            1: RNS.Identity.CRYPTO_PQ,
-            2: RNS.Identity.CRYPTO_HYBRID,
-        }.get(mode_flags)
+        logical.announce_mode = RNS.Identity.CRYPTO_PQ
         logical.data = assembled
         logical.fragment_set = fragment_set
         logical.hops = packet.hops
@@ -449,13 +492,10 @@ class Transport:
         if announce_mode is None:
             announce_mode = RNS.Identity.parse_announce(
                 packet.data, packet.context_flag)["mode"]
-        if announce_mode != RNS.Identity.CRYPTO_LEGACY:
+        if announce_mode == RNS.Identity.CRYPTO_PQ:
             from RNS.PQ import (fragment_record, RECORD_ANNOUNCE,
                                 FRAGMENT_RETRANSMIT_FLAG)
-            mode_flags = {
-                RNS.Identity.CRYPTO_PQ: 0x20,
-                RNS.Identity.CRYPTO_HYBRID: 0x40,
-            }[announce_mode]
+            mode_flags = 0x20
             retry_flag = 0
             if packet.fragment_set:
                 retry_flag = FRAGMENT_RETRANSMIT_FLAG ^ (
@@ -480,6 +520,8 @@ class Transport:
                 item.raw = item.header + item.ciphertext
                 packets.append(item)
             return packets
+        if announce_mode != RNS.Identity.CRYPTO_LEGACY:
+            raise ValueError("Unknown announce identity crypto mode")
         item = RNS.Packet(destination, packet.data, RNS.Packet.ANNOUNCE,
                           context=context, header_type=RNS.Packet.HEADER_2,
                           transport_type=Transport.TRANSPORT,
@@ -1558,6 +1600,26 @@ class Transport:
             # TODO: Enable when caching has been redesigned
             # Transport.cache(packet)
 
+        if (packet.context == RNS.Packet.PQ_FRAGMENT and
+                packet.destination_hash in Transport.link_table):
+            try:
+                from RNS.PQ import PQFragment, RECORD_LINK
+                if PQFragment.unpack(packet.data).record_kind == RECORD_LINK:
+                    Transport.link_table[packet.destination_hash][
+                        IDX_LT_VALIDATED] = True
+            except Exception:
+                pass
+        if (packet.context == RNS.Packet.PQ_FRAGMENT and
+                packet.destination_hash in Transport.reverse_table):
+            with Transport.reverse_table_lock:
+                reverse_entry = Transport.reverse_table.get(
+                    packet.destination_hash)
+            if (reverse_entry is not None and
+                    (packet.attached_interface is None or
+                     packet.attached_interface == reverse_entry[IDX_RT_OUTB_IF])):
+                packet_sent(packet)
+                Transport.transmit(reverse_entry[IDX_RT_RCVD_IF], packet.raw)
+                return True
         # Check if we have a known path for the destination in the path table
         if packet.packet_type != RNS.Packet.ANNOUNCE and packet.destination.type != RNS.Destination.PLAIN and packet.destination.type != RNS.Destination.GROUP and packet.destination_hash in Transport.path_table:
             path_entry = Transport.path_table.get(packet.destination_hash)
@@ -2323,11 +2385,25 @@ class Transport:
 
             # Link transport handling. Directs packets according
             # to entries in the link tables
-            if packet.packet_type != RNS.Packet.ANNOUNCE and packet.packet_type != RNS.Packet.LINKREQUEST and packet.context != RNS.Packet.LRPROOF:
+            if (packet.packet_type != RNS.Packet.ANNOUNCE and
+                    packet.packet_type != RNS.Packet.LINKREQUEST and
+                    packet.context != RNS.Packet.LRPROOF):
                 if packet.destination_hash in Transport.link_table:
                     link_entry = Transport.link_table[packet.destination_hash]
-                    if not link_entry[IDX_LT_VALIDATED]:
-                        RNS.log(f"Pre-validation link packet from {packet.receiving_interface}", RNS.LOG_WARNING) # TODO: Remove
+                    pq_link_fragment = False
+                    if packet.context == RNS.Packet.PQ_FRAGMENT:
+                        try:
+                            from RNS.PQ import PQFragment, RECORD_LINK
+                            pq_link_fragment = (
+                                PQFragment.unpack(packet.data).record_kind ==
+                                RECORD_LINK
+                            )
+                        except Exception:
+                            pass
+                    if pq_link_fragment:
+                        link_entry[IDX_LT_VALIDATED] = True
+                    elif not link_entry[IDX_LT_VALIDATED]:
+                        RNS.log(f"Pre-validation link packet from {packet.receiving_interface}", RNS.LOG_WARNING)
                         return packet.receiving_interface.protocol_violation("Link packet received before link validation") if packet.receiving_interface else None
 
                     # If receiving and outbound interface is
@@ -2799,7 +2875,18 @@ class Transport:
 
         # Handling for proofs and link-request proofs
         elif packet.packet_type == RNS.Packet.PROOF:
-            if packet.context == RNS.Packet.LRPROOF:
+            if packet.context == RNS.Packet.PQ_FRAGMENT and packet.destination_type == RNS.Destination.LINK:
+                with Transport.pending_links_lock:
+                    link = Transport.pending_links_map.get(packet.destination_hash)
+                if link is None:
+                    link = Transport.active_links_map.get(packet.destination_hash)
+                if link is not None:
+                    if link.attached_interface is None or link.attached_interface == packet.receiving_interface:
+                        packet.link = link
+                        link.validate_proof(packet)
+                    else:
+                        RNS.log("PQ link proof received on wrong interface, not processing it.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None
+            elif packet.context == RNS.Packet.LRPROOF:
                 # This is a link request proof, check if it needs to be transported
                 REBALANCE_LOGLEVEL = RNS.LOG_PATHING
                 if (RNS.Reticulum.transport_enabled() or for_local_client_link or from_local_client) and packet.destination_hash in Transport.link_table:
@@ -2955,8 +3042,6 @@ class Transport:
 
     @staticmethod
     def synthesize_tunnel(interface):
-        if RNS.Identity.CRYPTO_MODE != RNS.Identity.CRYPTO_LEGACY:
-            return
         try:
             interface_hash = interface.get_hash()
             public_key = RNS.Transport.identity.get_public_key()
@@ -2965,32 +3050,86 @@ class Transport:
             tunnel_id = RNS.Identity.full_hash(tunnel_id_data)
             signed_data = tunnel_id_data + random_hash
             signature = Transport.identity.sign(signed_data)
-            data = signed_data + signature
             tnl_snth_dst = RNS.Destination(None, RNS.Destination.OUT, RNS.Destination.PLAIN,
                                            Transport.APP_NAME, "tunnel", "synthesize")
-            packet = RNS.Packet(tnl_snth_dst, data, packet_type=RNS.Packet.DATA,
-                                transport_type=RNS.Transport.BROADCAST,
-                                header_type=RNS.Packet.HEADER_1, attached_interface=interface)
-            packet.send()
+
+            if RNS.Identity.CRYPTO_MODE == RNS.Identity.CRYPTO_LEGACY:
+                data = signed_data + signature
+                packet = RNS.Packet(tnl_snth_dst, data, packet_type=RNS.Packet.DATA,
+                                    transport_type=RNS.Transport.BROADCAST,
+                                    header_type=RNS.Packet.HEADER_1, attached_interface=interface)
+                packet.send()
+            elif RNS.Identity.CRYPTO_MODE == RNS.Identity.CRYPTO_PQ:
+                from RNS.PQ import RECORD_TUNNEL, fragment_record
+                mode = 1
+                data = (Transport.PQ_TUNNEL_MAGIC + bytes([mode]) +
+                        struct.pack("!H", len(public_key)) + signed_data + signature)
+                for fragment in fragment_record(RECORD_TUNNEL, data,
+                                                header_type=RNS.Packet.HEADER_1):
+                    packet = RNS.Packet.from_fragment(
+                        tnl_snth_dst, fragment.pack(), packet_type=RNS.Packet.DATA,
+                        context=RNS.Packet.PQ_FRAGMENT,
+                        header_type=RNS.Packet.HEADER_1, attached_interface=interface)
+                    packet.transport_type = RNS.Transport.BROADCAST
+                    packet.send()
+            else:
+                raise ValueError("Unknown identity crypto mode")
             interface.wants_tunnel = False
         except Exception as e:
             RNS.log(f"Could not synthesize tunnel for {interface}: {e}", RNS.LOG_ERROR)
 
     @staticmethod
     def tunnel_synthesize_handler(data, packet):
-        if RNS.Identity.CRYPTO_MODE != RNS.Identity.CRYPTO_LEGACY:
-            return
         try:
-            expected_length = RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8+RNS.Identity.SIGLENGTH//8
-            if len(data) == expected_length:
-                public_key = data[:RNS.Identity.KEYSIZE//8]
-                interface_hash = data[RNS.Identity.KEYSIZE//8:RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8]
-                tunnel_id_data = public_key+interface_hash
+            if data.startswith(Transport.PQ_TUNNEL_MAGIC):
+                header_size = len(Transport.PQ_TUNNEL_MAGIC) + 1 + 2
+                if len(data) < header_size:
+                    raise ValueError("truncated PQ tunnel synthesis packet")
+                mode = data[len(Transport.PQ_TUNNEL_MAGIC)]
+                public_length = struct.unpack_from(
+                    "!H", data, len(Transport.PQ_TUNNEL_MAGIC) + 1)[0]
+                offset = header_size
+                signature_length = {
+                    1: RNS.Identity.PQ_SIG_SIGNATURE_SIZE,
+                }.get(mode)
+                if signature_length is None:
+                    raise ValueError("invalid PQ tunnel identity mode")
+                public_key = data[offset:offset + public_length]
+                offset += public_length
+                interface_hash_length = RNS.Identity.HASHLENGTH // 8
+                random_length = RNS.Reticulum.TRUNCATED_HASHLENGTH // 8
+                if len(data) != offset + interface_hash_length + random_length + signature_length:
+                    raise ValueError("invalid PQ tunnel synthesis packet length")
+                interface_hash = data[offset:offset + interface_hash_length]
+                offset += interface_hash_length
+                random_hash = data[offset:offset + random_length]
+                offset += random_length
+                signature = data[offset:]
+                tunnel_id_data = public_key + interface_hash
                 tunnel_id = RNS.Identity.full_hash(tunnel_id_data)
-                random_hash = data[RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8:RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8]
-                signature = data[RNS.Identity.KEYSIZE//8+RNS.Identity.HASHLENGTH//8+RNS.Reticulum.TRUNCATED_HASHLENGTH//8:expected_length]
                 remote_transport_identity = RNS.Identity(create_keys=False)
-                if remote_transport_identity.load_public_key(public_key) and remote_transport_identity.validate(signature, tunnel_id_data+random_hash):
+                if (remote_transport_identity.load_public_key(public_key) and
+                        remote_transport_identity.validate(signature, tunnel_id_data + random_hash)):
+                    Transport.handle_tunnel(tunnel_id, packet.receiving_interface)
+                return
+
+            expected_length = (
+                RNS.Identity.KEYSIZE // 8 + RNS.Identity.HASHLENGTH // 8 +
+                RNS.Reticulum.TRUNCATED_HASHLENGTH // 8 + RNS.Identity.SIGLENGTH // 8)
+            if len(data) == expected_length:
+                public_length = RNS.Identity.KEYSIZE // 8
+                interface_length = RNS.Identity.HASHLENGTH // 8
+                random_length = RNS.Reticulum.TRUNCATED_HASHLENGTH // 8
+                public_key = data[:public_length]
+                interface_hash = data[public_length:public_length + interface_length]
+                tunnel_id_data = public_key + interface_hash
+                tunnel_id = RNS.Identity.full_hash(tunnel_id_data)
+                random_offset = public_length + interface_length
+                random_hash = data[random_offset:random_offset + random_length]
+                signature = data[random_offset + random_length:]
+                remote_transport_identity = RNS.Identity(create_keys=False)
+                if (remote_transport_identity.load_public_key(public_key) and
+                        remote_transport_identity.validate(signature, tunnel_id_data + random_hash)):
                     Transport.handle_tunnel(tunnel_id, packet.receiving_interface)
         except Exception as e:
             RNS.log("An error occurred while validating tunnel establishment packet.", RNS.LOG_DEBUG) if RNS.sl(RNS.LOG_DEBUG) else None

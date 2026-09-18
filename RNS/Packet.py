@@ -119,7 +119,7 @@ class Packet:
     __slots__ += "transport_id", "data", "flags", "raw", "packed", "sent", "create_receipt", "receipt", "fromPacked", "MTU"
     __slots__ += "sent_at", "packet_hash", "ratchet_id", "attached_interface", "receiving_interface", "rssi", "snr", "q"
     __slots__ += "ciphertext", "plaintext", "destination_hash", "destination_type", "link", "map_hash", "is_outbound_pr"
-    __slots__ += "traffic_class", "announce_signature_validated", "announce_mode", "fragment_set", "pq_session_ack"
+    __slots__ += "traffic_class", "announce_signature_validated", "announce_mode", "fragment_set", "pq_session_ack", "pq_session_proof"
 
     def __init__(self, destination, data, packet_type = DATA, context = NONE, transport_type = RNS.Transport.BROADCAST,
                  header_type = HEADER_1, transport_id = None, attached_interface = None, create_receipt = True, context_flag=FLAG_UNSET):
@@ -172,6 +172,7 @@ class Packet:
         self.announce_mode = None
         self.fragment_set = None
         self.pq_session_ack = None
+        self.pq_session_proof = None
 
     def get_packed_flags(self):
         if self.context == Packet.LRPROOF:
@@ -323,9 +324,12 @@ class Packet:
             if (self.packet_type == Packet.DATA and
                     self.context != Packet.PQ_FRAGMENT and self.destination is not None and
                     self.destination.type == RNS.Destination.SINGLE and
-                    self.destination.identity is not None and
-                    self.destination.identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY):
-                return self._send_pq_session()
+                    self.destination.identity is not None):
+                mode = self.destination.identity.crypto_mode
+                if mode == RNS.Identity.CRYPTO_PQ:
+                    return self._send_pq_session()
+                if mode != RNS.Identity.CRYPTO_LEGACY:
+                    raise ValueError("Unknown identity crypto mode")
             if self.hops >= RNS.Transport.PATHFINDER_M: return False
             if not self.packed: self.pack()
             if self.destination.type == RNS.Destination.LINK:
@@ -373,6 +377,8 @@ class Packet:
         else: raise IOError("Packet was not sent yet")
 
     def prove(self, destination=None):
+        if self.pq_session_proof is not None:
+            return
         if self.fromPacked and hasattr(self, "destination") and self.destination:
             if self.destination.identity and self.destination.identity.has_private_key():
                 self.destination.identity.prove(self, destination)
@@ -456,7 +462,7 @@ class PacketReceipt:
         self.truncated_hash = packet.truncated_packet_hash
         self.sent           = True
         self.hash           = packet.packet_hash if packet.packet_hash is not None else packet.get_hash()
-        self.truncated_hash = RNS.Identity.truncated_hash(self.hash)
+        self.truncated_hash = packet.truncated_packet_hash
         self.sent_at        = time.time()
         self.status         = PacketReceipt.SENT
         self.destination    = packet.destination
@@ -490,12 +496,15 @@ class PacketReceipt:
         if proof_hash != self.hash:
             return False
         identity = getattr(getattr(link, "destination", None), "identity", None)
-        if len(proof) == RNS.Identity.HASHLENGTH//8 + 32 and identity is not None and identity.crypto_mode != RNS.Identity.CRYPTO_LEGACY:
+        mode = identity.crypto_mode if identity is not None else None
+        if len(proof) == RNS.Identity.HASHLENGTH//8 + 32 and mode == RNS.Identity.CRYPTO_PQ:
             mac = proof[RNS.Identity.HASHLENGTH//8:]
             valid = hmac.compare_digest(mac, hmac.new(link.derived_key, self.hash, "sha256").digest())
-        else:
+        elif mode == RNS.Identity.CRYPTO_LEGACY:
             signature = proof[RNS.Identity.HASHLENGTH//8:]
             valid = link.validate(signature, self.hash)
+        else:
+            return False
         if not valid:
             return False
         self.status = PacketReceipt.DELIVERED
@@ -506,60 +515,73 @@ class PacketReceipt:
         if self.callbacks.delivery is not None:
             self.callbacks.delivery(self)
         return True
+    def validate_pq_proof(self, proof, proof_packet=None):
+        if len(proof) != 8 + RNS.Identity.HASHLENGTH//8 + 32:
+            return False
+        if proof[8:8 + RNS.Identity.HASHLENGTH//8] != self.hash:
+            return False
+        self.status = PacketReceipt.DELIVERED
+        self.proved = True
+        self.concluded_at = time.time()
+        self.proof_packet = proof_packet
+        if self.callbacks.delivery is not None:
+            try:
+                self.callbacks.delivery(self)
+            except Exception as e:
+                RNS.log("Error while executing PQ proof validated callback. The contained exception was: "+str(e),
+                        RNS.LOG_ERROR)
+        return True
+
 
     # Validate a raw proof
     def validate_proof(self, proof, proof_packet=None):
         if not hasattr(self.destination, "identity") or self.destination.identity == None:
             return False
 
-        signature_lens = [RNS.Identity._signature_size(self.destination.identity.crypto_mode)]
-        if self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_HYBRID:
-            signature_lens = [RNS.Identity._legacy_signature_size(), RNS.Identity.PQ_SIG_SIGNATURE_SIZE, RNS.Identity._legacy_signature_size()+RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
-        elif self.destination.identity.crypto_mode == RNS.Identity.CRYPTO_PQ:
-            signature_lens = [RNS.Identity.PQ_SIG_SIGNATURE_SIZE]
+        mode = self.destination.identity.crypto_mode
+        if mode == RNS.Identity.CRYPTO_PQ:
+            signature_len = RNS.Identity.PQ_SIG_SIGNATURE_SIZE
+        elif mode == RNS.Identity.CRYPTO_LEGACY:
+            signature_len = RNS.Identity._legacy_signature_size()
         else:
-            signature_lens = [RNS.Identity._legacy_signature_size()]
+            return False
 
-        for signature_len in signature_lens:
-            if len(proof) == RNS.Identity.HASHLENGTH//8 + signature_len:
-                # This is an explicit proof
-                proof_hash = proof[:RNS.Identity.HASHLENGTH//8]
-                signature = proof[RNS.Identity.HASHLENGTH//8:RNS.Identity.HASHLENGTH//8+signature_len]
-                if proof_hash == self.hash:
-                    proof_valid = self.destination.identity.validate(signature, self.hash)
-                    if proof_valid:
-                        self.status = PacketReceipt.DELIVERED
-                        self.proved = True
-                        self.concluded_at = time.time()
-                        self.proof_packet = proof_packet
-
-                        if self.callbacks.delivery != None:
-                            try: self.callbacks.delivery(self)
-                            except Exception as e:
-                                RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
-
-                        return True
-                    
-                    else: return False
-                else: return False
-
-            elif len(proof) == signature_len:
-                # This is an implicit proof
-                signature = proof[:signature_len]
+        if len(proof) == RNS.Identity.HASHLENGTH//8 + signature_len:
+            # This is an explicit proof
+            proof_hash = proof[:RNS.Identity.HASHLENGTH//8]
+            signature = proof[RNS.Identity.HASHLENGTH//8:RNS.Identity.HASHLENGTH//8+signature_len]
+            if proof_hash == self.hash:
                 proof_valid = self.destination.identity.validate(signature, self.hash)
                 if proof_valid:
-                        self.status = PacketReceipt.DELIVERED
-                        self.proved = True
-                        self.concluded_at = time.time()
-                        self.proof_packet = proof_packet
+                    self.status = PacketReceipt.DELIVERED
+                    self.proved = True
+                    self.concluded_at = time.time()
+                    self.proof_packet = proof_packet
 
-                        if self.callbacks.delivery != None:
-                            try: self.callbacks.delivery(self)
-                            except Exception as e: RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
-                                
-                        return True
+                    if self.callbacks.delivery != None:
+                        try: self.callbacks.delivery(self)
+                        except Exception as e:
+                            RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
 
+                    return True
                 else: return False
+            else: return False
+
+        if len(proof) == signature_len:
+            # This is an implicit proof
+            signature = proof[:signature_len]
+            proof_valid = self.destination.identity.validate(signature, self.hash)
+            if proof_valid:
+                self.status = PacketReceipt.DELIVERED
+                self.proved = True
+                self.concluded_at = time.time()
+                self.proof_packet = proof_packet
+
+                if self.callbacks.delivery != None:
+                    try: self.callbacks.delivery(self)
+                    except Exception as e: RNS.log("Error while executing proof validated callback. The contained exception was: "+str(e), RNS.LOG_ERROR)
+
+                return True
         return False
 
     def get_rtt(self):

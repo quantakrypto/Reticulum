@@ -117,7 +117,7 @@ Returns whether proofs sent are explicit or implicit.
 
 #### `static crypto_mode()`
 
-Returns the active crypto profile (`legacy`, `hybrid`, or `pq`).
+Returns the active crypto profile (`legacy` or `pq`).
 
 #### `static transport_enabled()`
 

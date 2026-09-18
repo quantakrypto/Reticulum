@@ -185,7 +185,8 @@ class Resource:
             resource.initiator            = False
             resource.callback             = callback
             resource.__progress_callback  = progress_callback
-            resource.total_parts          = int(math.ceil(resource.size/float(resource.sdu)))
+            resource.total_parts          = adv.n
+            resource.sdu                  = int(math.ceil(resource.size/float(resource.total_parts))) if resource.total_parts > 0 else resource.sdu
             resource.received_count       = 0
             resource.outstanding_parts    = 0
             resource.parts                = [None] * resource.total_parts

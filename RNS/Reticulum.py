@@ -582,8 +582,6 @@ class Reticulum:
                     v = str(self.config["reticulum"][option]).lower().replace("-", "_")
                     if v in ["legacy", "classical"]:
                         Reticulum.__crypto_mode = RNS.Identity.CRYPTO_LEGACY
-                    elif v in ["hybrid", "mixed"]:
-                        Reticulum.__crypto_mode = RNS.Identity.CRYPTO_HYBRID
                     elif v in ["pq", "pq_only", "post_quantum", "post_quantum_only"]:
                         Reticulum.__crypto_mode = RNS.Identity.CRYPTO_PQ
                     else:
@@ -2114,7 +2112,7 @@ enable_transport = False
 
 # Configure post-quantum crypto mode. Explicit PQ modes require the
 # optional liboqs-python capability and never silently downgrade.
-# Valid values: legacy, hybrid, pq
+# Valid values: legacy, pq
 crypto_mode = legacy
 
 

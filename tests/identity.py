@@ -4,6 +4,7 @@ import time
 import RNS
 import os
 from unittest import skipIf
+from RNS.Utilities import rnid
 
 signed_message = "e51a008b8b8ba855993d8892a40daad84a6fb69a7138e1b5f69b427fe03449826ab6ccb81f0d72b4725e8d55c814d3e8e151b495cf5b59702f197ec366d935ad04a98ca519d6964f96ea09910b020351d1cdff3befbad323a2a28a6ec7ced4d0d67f02c525f93b321d9b076d704408475bd2d123cd51916f7e49039246ac56add37ef87e32d7f9853ac44a7f77d26fedc83e4e67a45742b751c2599309f5eda6efa0dafd957f61af1f0e86c4d6c5052e0e5fa577db99846f2b7a0204c31cef4013ca51cb307506c9209fd18d0195a7c9ae628af1a1d9ee7a4cf30037ed190a9fdcaa4ce5bb7bea19803cb5b5cea8c21fdb98d8f73ff5aaad87f5f6c3b7bcfe8974e5b063cc1113d77b9e96bec1c9d10ed37b780c3f7349a34092bb3968daeced40eb0b5130c0d11595e30b9671896385d04289d067f671599386536eed8430a72e186fb95023d5ac5dd442443bfabfe13a84a38d060af73bf20f921f38a768672fdbcb1dfece7458166e2e15948d6b4fa81f42db48747d283c670f576a0b410b31a70d2594823d0e29135a488cb0408c9e5bc1e197ff99aef471924231ccc8e3eddc82dbcea4801f14c5fc7a389a26a52cc93cfe0770953ef595ff410b7033a6ed5c975dd922b3f48f9dffcfb412eeed5758f3aa51de7eb47cd2cb"
 sig_from_key_0 = "3020ef58f861591826a61c3d2d4a25b949cdb3094085ba6b1177a6f2a05f3cdd24d1095d6fdd078f0b2826e80b261c93c1ff97fbfd4857f25706d57dd073590c"
@@ -277,13 +278,19 @@ class TestIdentity(unittest.TestCase):
         print()
 
     @skipIf(not RNS.Cryptography.pq_available(), "liboqs not available")
-    def test_3_pq_hybrid_roundtrip(self):
+    def test_3_pq_roundtrip(self):
+        from RNS.vendor import umsgpack
         old_mode = RNS.Identity.CRYPTO_MODE
         try:
-            RNS.Identity.set_crypto_mode(RNS.Identity.CRYPTO_HYBRID)
+            RNS.Identity.set_crypto_mode(RNS.Identity.CRYPTO_PQ)
             sender = RNS.Identity()
             receiver = RNS.Identity(create_keys=False)
-            receiver.load_public_key(sender.get_public_key())
+            public_bundle = sender.serialize_public_key()
+            private_bundle = sender.serialize_private_key()
+            self.assertTrue(receiver.load_public_key(public_bundle))
+            reloaded = RNS.Identity.from_bytes(private_bundle)
+            self.assertIsNotNone(reloaded)
+            self.assertEqual(reloaded.get_public_key(), sender.get_public_key())
 
             message = b"pq roundtrip"
             signature = sender.sign(message)
@@ -291,6 +298,28 @@ class TestIdentity(unittest.TestCase):
 
             token = receiver.encrypt(message)
             self.assertEqual(message, sender.decrypt(token))
+
+            public_payload = umsgpack.unpackb(
+                public_bundle[len(RNS.Identity.KEY_FORMAT_MAGIC):])
+            public_payload["mode"] = "hybrid"
+            hybrid_public = RNS.Identity.KEY_FORMAT_MAGIC + umsgpack.packb(public_payload)
+            private_payload = umsgpack.unpackb(
+                private_bundle[len(RNS.Identity.KEY_FORMAT_MAGIC):])
+            private_payload["mode"] = "hybrid"
+            hybrid_private = RNS.Identity.KEY_FORMAT_MAGIC + umsgpack.packb(private_payload)
+            with self.assertRaisesRegex(ValueError, "Unknown identity crypto mode: hybrid"):
+                RNS.Identity.set_crypto_mode("hybrid")
+            self.assertFalse(rnid._valid_identity_bytes(hybrid_public))
+            self.assertFalse(rnid._valid_identity_bytes(hybrid_private, private=True))
+            self.assertFalse(RNS.Identity(create_keys=False).load_public_key(hybrid_public))
+            self.assertFalse(RNS.Identity.from_bytes(hybrid_private))
+            self.assertFalse(RNS.Identity(create_keys=False).load_public_key(b"\0" * 3200))
+
+            rsg_payload = umsgpack.packb({
+                "hashtype": "sha256",
+                "meta": {"pubkey": sender.get_public_key()},
+            })
+            self.assertIsNone(rnid._parse_rsg_signature(b"\0" * 3373 + rsg_payload))
         finally:
             RNS.Identity.set_crypto_mode(old_mode)
 
