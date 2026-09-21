@@ -1,6 +1,9 @@
 Reticulum Network Stack <img align="right" src="https://static.pepy.tech/personalized-badge/rns?period=month&units=international_system&left_color=grey&right_color=blue&left_text=Installs/month" style="padding-left:10px"/><a href="https://github.com/markqvist/Reticulum/actions/workflows/build.yml"><img align="right" src="https://github.com/markqvist/Reticulum/actions/workflows/build.yml/badge.svg"/></a>
 ==========
 
+> [!WARNING]  
+> A significant number of hastily launched, incorrect, dubious, directly harmful and, in most cases, entirely LLM-generated fakes of Reticulum implementations are currently being marketed and pushed under polished, but ultimately misleading or outright deceptive claims. For more detailed information, see the relevant sections of the [Brandolini's Reference](https://reticulum.network/manual/brandolinis.html) chapter of the manual. Known good community implementations are listed in the **Community Implementations** section of this readme.
+
 <p align="center"><img width="200" src="https://raw.githubusercontent.com/markqvist/Reticulum/master/docs/source/graphics/rns_logo_512.png"></p>
 
 *This repository is [a public mirror](./MIRROR.md). All development is happening elsewhere.*
@@ -98,6 +101,29 @@ implementation that achieves this is Reticulum. Any that does not is not Reticul
 The reference implementation is licensed under the Reticulum License.
 
 The Reticulum Protocol was dedicated to the Public Domain in 2016.
+
+## Community Implementations
+
+The implementations listed here have demonstrated wire-compatibility, sufficient feature parity, sensible security and development practices, long-term commitment and care for implementation quality. Additionally, they have a track record of at least 18 months of active development. Most importantly, their developers and maintainers are recognized by the community to actually know what they are doing, and as having a commitment to improving the overall Reticulum ecosystem.
+
+- [Chad Atterman's](https://github.com/attermann) [microReticulum](https://github.com/attermann/microReticulum/) is a C++ implementation targeting 32-bit micro-controllers.
+- [Quad4's](https://quad4.io/) [Reticulum-Go](https://reticulum-go.quad4.io/) is a Go implementation targeting both desktop, mobile and embedded systems.
+
+*If you are the maintainer of an implementation not listed above, and believe that it deserves inclusion by following the same standards of rigor and commitment, your proposal will be welcomed.*
+
+---
+
+**Warning!** A significant number of hastily launched, incorrect, dubious, directly harmful and, in most cases, entirely LLM-generated fakes of Reticulum implementations (and user facing applications) are currently being marketed and pushed under polished, but ultimately misleading or outright deceptive claims. Most of these are either quick attention or money grabs, completely unreviewed, incompatible, without maintenance or human oversight, actively trying to fragment the community, or a combination thereof.
+
+---
+
+For more extensive information on this topic, read the [Brandolini's Reference](https://reticulum.network/manual/brandolinis.html) chapter of the manual. That chapter is very long, very detailed, and is the polite, measured analysis, intended as an evolving, sectioned reference on these issues.
+
+If you would rather just have the short, unfiltered and quite angry version, which consists of an enacted response to one particular manifestation of the phenomenon as a whole, used as an example, you can read [Yes, I am Angry](docs/history/2026_09_18_Yes_I_am_Angry.md). It gets the same point across, in a very different language, if you can handle that sort of communication.
+
+The core Reticulum maintainers and developers **strongly advise against using any such "implementation"**. The [deceitful and self-serving behavior](https://reticulum.network/manual/brandolinis.html#a-persistent-but-fragile-triad) of a small number of either malintented, attention-seeking or incompetent individuals has caused significant [damage and waste of time and resources](https://reticulum.network/manual/brandolinis.html#intent-consequence) for both developers, node operators, users and the community and Reticulum project at large.
+
+We kindly, but urgently ask all users to excercise caution, common sense and healthy skepticism when [evaluating](https://reticulum.network/manual/brandolinis.html#evaluating-a-reticulum-implementation) the potential use of any implementation not listed above; and to accept that **choosing to do so regardless translates the responsibility for potential damage from an irresponsible or malicious individual onto yourself**.
 
 ## Examples of Reticulum Applications
 If you want to quickly get an idea of what Reticulum can do, take a look at the
